@@ -1,3 +1,5 @@
 aiogram
 groq
 aiofiles
+PyPDF2
+python-docx
