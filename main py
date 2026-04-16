@@ -1,0 +1,122 @@
+import asyncio
+import json
+import os
+import aiofiles
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from groq import AsyncGroq
+
+# === НАСТРОЙКИ ===
+TELEGRAM_BOT_TOKEN = "8603687714:AAFlbmp3AnUOp489DSv0FBpUv1CZIHkxzRM"
+GROQ_API_KEY = "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"
+
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+dp = Dispatcher()
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+
+# Папка для хранения истории
+DATA_DIR = "user_data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+MAX_HISTORY_LENGTH = 10  # Максимальное число сообщений в истории
+
+# === ФУНКЦИИ РАБОТЫ С ФАЙЛАМИ ИСТОРИИ ===
+def get_user_file_path(user_id: int) -> str:
+    return os.path.join(DATA_DIR, f"{user_id}.json")
+
+async def load_history(user_id: int) -> list:
+    """Загружает историю из файла. Возвращает список сообщений."""
+    file_path = get_user_file_path(user_id)
+    if not os.path.exists(file_path):
+        return []
+    try:
+        async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+            content = await f.read()
+            return json.loads(content)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return []
+
+async def save_history(user_id: int, history: list):
+    """Сохраняет историю в файл."""
+    file_path = get_user_file_path(user_id)
+    async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+        await f.write(json.dumps(history, ensure_ascii=False, indent=2))
+
+# === ХЕНДЛЕРЫ ===
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "Привет! Я бот с Groq и памятью в файле.\n"
+        "Напиши мне что-нибудь, я запомню контекст.\n"
+        "/clear — очистить историю.\n"
+        "/history — показать сохранённую историю."
+    )
+
+@dp.message(Command("clear"))
+async def cmd_clear(message: types.Message):
+    user_id = message.from_user.id
+    file_path = get_user_file_path(user_id)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    await message.reply("🧹 История диалога очищена.")
+
+@dp.message(Command("history"))
+async def cmd_history(message: types.Message):
+    user_id = message.from_user.id
+    history = await load_history(user_id)
+    if not history:
+        await message.reply("📭 История пуста.")
+        return
+    # Красивый вывод последних сообщений
+    text = "📜 **Последние сообщения:**\n"
+    for msg in history[-6:]:  # покажем последние 6 сообщений
+        role = "👤" if msg["role"] == "user" else "🤖"
+        content = msg["content"][:100] + ("..." if len(msg["content"]) > 100 else "")
+        text += f"{role} {content}\n"
+    await message.reply(text)
+
+@dp.message()
+async def handle_text(message: types.Message):
+    user_id = message.from_user.id
+    user_text = message.text
+
+    # Загружаем историю из файла
+    history = await load_history(user_id)
+
+    # Добавляем сообщение пользователя
+    history.append({"role": "user", "content": user_text})
+
+    try:
+        # Отправляем в Groq всю историю
+        response = await groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=history
+        )
+        reply = response.choices[0].message.content
+
+        # Добавляем ответ ассистента
+        history.append({"role": "assistant", "content": reply})
+
+        # Ограничиваем длину истории (обрезаем старые)
+        if len(history) > MAX_HISTORY_LENGTH:
+            history = history[-MAX_HISTORY_LENGTH:]
+
+        # Сохраняем обновлённую историю в файл
+        await save_history(user_id, history)
+
+        await message.reply(reply)
+
+    except Exception as e:
+        # В случае ошибки убираем последнее сообщение пользователя
+        if history and history[-1]["role"] == "user":
+            history.pop()
+        await save_history(user_id, history)  # сохраняем без ошибочного сообщения
+        await message.reply(f"❌ Ошибка: {e}")
+
+# === ЗАПУСК ===
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == '__main__':
+    print("Бот с файловой памятью запущен...")
+    asyncio.run(main())
