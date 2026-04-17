@@ -10,12 +10,14 @@ import PyPDF2
 from docx import Document
 import yt_dlp
 
-# === НАСТРОЙКИ (БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ) ===
-TELEGRAM_BOT_TOKEN = os.getenv("8603687714:AAFlbmp3AnUOp489DSv0FBpUv1CZIHkxzRM")
-GROQ_API_KEY = os.getenv("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")
+# === НАСТРОЙКИ (ИМПОРТ ИЗ config.py) ===
+try:
+    from config import TELEGRAM_BOT_TOKEN, GROQ_API_KEY
+except ImportError:
+    raise ImportError("Не найден файл config.py или в нём отсутствуют TELEGRAM_BOT_TOKEN / GROQ_API_KEY")
 
 if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
-    raise ValueError("Не заданы TELEGRAM_BOT_TOKEN или GROQ_API_KEY в переменных окружения")
+    raise ValueError("TELEGRAM_BOT_TOKEN или GROQ_API_KEY не могут быть пустыми в config.py")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -290,7 +292,7 @@ async def handle_text(message: types.Message):
         await save_history(user_id, history)
         await message.reply(f"❌ Ошибка: {e}")
 
-# === ЗАПУСК (ИСПРАВЛЕННЫЙ БЛОК) ===
+# === ЗАПУСК ===
 async def main():
     await dp.start_polling(bot)
 
