@@ -132,7 +132,7 @@ async def download_video(url: str, user_id: int) -> str | None:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Привет! Я бот с Groq и памятью в файлах.\n\n"
+        "👋 Привет! Я бот SkipperAI.\n\n"
         "📝 **Возможности:**\n"
         "— Отвечаю на текстовые сообщения с учётом истории.\n"
         "— Принимаю документы (TXT, PDF, DOCX) и анализирую их содержимое.\n"
@@ -141,7 +141,6 @@ async def cmd_start(message: types.Message):
         "🔹 /clear — очистить историю\n"
         "🔹 /history — показать историю\n"
         "🔹 /dl <ссылка> — скачать видео\n"
-        "🔹 Отправьте `administratormode` для входа в режим администратора"
     )
 
 @dp.message(Command("clear"))
@@ -191,7 +190,7 @@ async def process_password(message: types.Message, state: FSMContext):
         await message.reply("❌ Неверный пароль.")
     await state.clear()
 
-# Команда /users (только для админов)
+# Команда /users (только для админов) — ИСПРАВЛЕНО: Пользователь(ID)
 @dp.message(Command("users"))
 async def cmd_users(message: types.Message):
     if message.from_user.id not in admin_sessions:
@@ -206,14 +205,14 @@ async def cmd_users(message: types.Message):
             return
         text = "👥 **Пользователи с историей:**\n"
         for uid in sorted(user_ids)[:30]:
-            text += f"• `{uid}`\n"
+            text += f"• Пользователь(`{uid}`)\n"
         if len(user_ids) > 30:
             text += f"\n... и ещё {len(user_ids) - 30}"
         await message.reply(text, parse_mode="Markdown")
     except Exception as e:
         await message.reply(f"❌ Ошибка при чтении списка пользователей: {e}")
 
-# Команда /history_admin <user_id> (только для админов)
+# Команда /history_admin <user_id> (только для админов) — ПОЛНЫЙ ТЕКСТ
 @dp.message(Command("history_admin"))
 async def cmd_history_admin(message: types.Message):
     if message.from_user.id not in admin_sessions:
@@ -236,14 +235,21 @@ async def cmd_history_admin(message: types.Message):
         await message.reply(f"📭 У пользователя {target_id} нет истории.")
         return
 
-    text = f"📜 **История пользователя {target_id}:**\n"
-    for msg in history[-10:]:
-        role = "👤" if msg["role"] == "user" else "🤖"
-        content = msg["content"].replace('\n', ' ')[:150]
-        if len(msg["content"]) > 150:
-            content += "..."
-        text += f"{role} {content}\n"
-    await message.reply(text)
+    # Показываем последние 10 записей (5 вопросов-ответов)
+    last_messages = history[-10:]
+    text = f"📜 **История пользователя {target_id} (последние сообщения):**\n\n"
+    
+    for msg in last_messages:
+        role = "👤 Пользователь" if msg["role"] == "user" else "🤖 SkipperAI"
+        content = msg["content"]
+        text += f"{role}:\n{content}\n\n"
+    
+    # Разбиваем на части, если сообщение слишком длинное (лимит Telegram — 4096 символов)
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await message.reply(text[i:i+4000])
+    else:
+        await message.reply(text)
 
 # === ОБРАБОТЧИК СКАЧИВАНИЯ ПО КОМАНДЕ ===
 @dp.message(Command("dl"))
