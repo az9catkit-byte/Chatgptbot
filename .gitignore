@@ -1,0 +1,7 @@
+# .gitignore
+config.py
+user_data/
+downloads/
+__pycache__/
+*.pyc
+.env
