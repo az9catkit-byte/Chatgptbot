@@ -3,8 +3,11 @@ import json
 import os
 import re
 import aiofiles
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from groq import AsyncGroq
 import PyPDF2
 from docx import Document
@@ -12,15 +15,16 @@ import yt_dlp
 
 # === НАСТРОЙКИ (ИМПОРТ ИЗ config.py) ===
 try:
-    from config import TELEGRAM_BOT_TOKEN, GROQ_API_KEY
+    from config import TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD
 except ImportError:
-    raise ImportError("Не найден файл config.py или в нём отсутствуют TELEGRAM_BOT_TOKEN / GROQ_API_KEY")
+    raise ImportError("Не найден файл config.py или в нём отсутствуют необходимые переменные")
 
-if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
-    raise ValueError("TELEGRAM_BOT_TOKEN или GROQ_API_KEY не могут быть пустыми в config.py")
+if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY or not ADMIN_PASSWORD:
+    raise ValueError("TELEGRAM_BOT_TOKEN, GROQ_API_KEY и ADMIN_PASSWORD не могут быть пустыми в config.py")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # Папки
@@ -30,6 +34,13 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 MAX_HISTORY_LENGTH = 10
+
+# === ХРАНЕНИЕ СЕССИЙ АДМИНИСТРАТОРА ===
+admin_sessions = set()
+
+# === СОСТОЯНИЯ ДЛЯ FSM (ВВОД ПАРОЛЯ) ===
+class AdminAuth(StatesGroup):
+    waiting_for_password = State()
 
 # === ФУНКЦИИ ДЛЯ ИСТОРИИ ===
 def get_user_file_path(user_id: int) -> str:
@@ -129,7 +140,8 @@ async def cmd_start(message: types.Message):
         "— Если пришлёте фото с подписью, я запомню контекст.\n\n"
         "🔹 /clear — очистить историю\n"
         "🔹 /history — показать историю\n"
-        "🔹 /dl <ссылка> — скачать видео"
+        "🔹 /dl <ссылка> — скачать видео\n"
+        "🔹 Отправьте `administratormode` для входа в режим администратора"
     )
 
 @dp.message(Command("clear"))
@@ -151,6 +163,85 @@ async def cmd_history(message: types.Message):
     for msg in history[-6:]:
         role = "👤" if msg["role"] == "user" else "🤖"
         content = msg["content"][:100] + ("..." if len(msg["content"]) > 100 else "")
+        text += f"{role} {content}\n"
+    await message.reply(text)
+
+# === АДМИНИСТРАТИВНЫЙ ВХОД ПО КЛЮЧЕВОМУ СЛОВУ ===
+@dp.message(F.text.lower() == "administratormode")
+async def admin_mode_trigger(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    # Если уже админ — выходим
+    if user_id in admin_sessions:
+        admin_sessions.remove(user_id)
+        await message.reply("🔓 Вы вышли из режима администратора.")
+        return
+
+    # Иначе запрашиваем пароль
+    await message.reply("🔐 Введите пароль администратора:")
+    await state.set_state(AdminAuth.waiting_for_password)
+
+@dp.message(StateFilter(AdminAuth.waiting_for_password))
+async def process_password(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if message.text == ADMIN_PASSWORD:
+        admin_sessions.add(user_id)
+        await message.reply("✅ Пароль верный. Вы вошли в режим администратора.\nДоступные команды:\n/users — список пользователей\n/history_admin <user_id> — история пользователя")
+    else:
+        await message.reply("❌ Неверный пароль.")
+    await state.clear()
+
+# Команда /users (только для админов)
+@dp.message(Command("users"))
+async def cmd_users(message: types.Message):
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
+    try:
+        files = os.listdir(DATA_DIR)
+        user_ids = [int(f.replace('.json', '')) for f in files if f.endswith('.json')]
+        if not user_ids:
+            await message.reply("📭 Нет ни одного пользователя с историей.")
+            return
+        text = "👥 **Пользователи с историей:**\n"
+        for uid in sorted(user_ids)[:30]:
+            text += f"• `{uid}`\n"
+        if len(user_ids) > 30:
+            text += f"\n... и ещё {len(user_ids) - 30}"
+        await message.reply(text, parse_mode="Markdown")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка при чтении списка пользователей: {e}")
+
+# Команда /history_admin <user_id> (только для админов)
+@dp.message(Command("history_admin"))
+async def cmd_history_admin(message: types.Message):
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.reply("Используйте: /history_admin <user_id>")
+        return
+
+    try:
+        target_id = int(args[1])
+    except ValueError:
+        await message.reply("ID пользователя должен быть числом.")
+        return
+
+    history = await load_history(target_id)
+    if not history:
+        await message.reply(f"📭 У пользователя {target_id} нет истории.")
+        return
+
+    text = f"📜 **История пользователя {target_id}:**\n"
+    for msg in history[-10:]:
+        role = "👤" if msg["role"] == "user" else "🤖"
+        content = msg["content"].replace('\n', ' ')[:150]
+        if len(msg["content"]) > 150:
+            content += "..."
         text += f"{role} {content}\n"
     await message.reply(text)
 
@@ -197,7 +288,7 @@ async def handle_url_message(message: types.Message):
                     os.remove(file_path)
             else:
                 await message.reply("❌ Не удалось скачать видео.")
-            break  # Скачиваем только первое видео, чтобы не спамить
+            break
 
 # === ОБРАБОТЧИК ДОКУМЕНТОВ ===
 @dp.message(lambda message: message.document is not None)
