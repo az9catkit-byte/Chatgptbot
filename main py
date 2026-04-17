@@ -1,16 +1,21 @@
 import asyncio
 import json
 import os
+import re
 import aiofiles
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from groq import AsyncGroq
 import PyPDF2
 from docx import Document
+import yt_dlp
 
-# === НАСТРОЙКИ ===
-TELEGRAM_BOT_TOKEN = "8603687714:AAFlbmp3AnUOp489DSv0FBpUv1CZIHkxzRM"
-GROQ_API_KEY = "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"
+# === НАСТРОЙКИ (БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ) ===
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
+    raise ValueError("Не заданы TELEGRAM_BOT_TOKEN или GROQ_API_KEY в переменных окружения")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -66,7 +71,6 @@ def extract_text_from_docx(file_path: str) -> str:
     return "\n".join([p.text for p in doc.paragraphs])
 
 async def process_document(message: types.Message) -> tuple[str, str]:
-    """Скачивает документ, извлекает текст, возвращает (имя_файла, текст)."""
     document = message.document
     file_name = document.file_name.lower()
     file_id = document.file_id
@@ -88,6 +92,29 @@ async def process_document(message: types.Message) -> tuple[str, str]:
     os.remove(file_path)
     return file_name, extracted_text.strip()
 
+# === ФУНКЦИЯ ДЛЯ СКАЧИВАНИЯ ВИДЕО ===
+async def download_video(url: str, user_id: int) -> str | None:
+    ydl_opts = {
+        'format': 'best[height<=720]',
+        'outtmpl': os.path.join(DOWNLOADS_DIR, f'{user_id}_%(title)s.%(ext)s'),
+        'quiet': True,
+        'no_warnings': True,
+        'max_filesize': 50 * 1024 * 1024,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            base, _ = os.path.splitext(filename)
+            for ext in ['.mp4', '.webm', '.mkv']:
+                potential_path = base + ext
+                if os.path.exists(potential_path):
+                    return potential_path
+            return None
+    except Exception as e:
+        print(f"Ошибка скачивания: {e}")
+        return None
+
 # === ХЕНДЛЕРЫ КОМАНД ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -96,9 +123,11 @@ async def cmd_start(message: types.Message):
         "📝 **Возможности:**\n"
         "— Отвечаю на текстовые сообщения с учётом истории.\n"
         "— Принимаю документы (TXT, PDF, DOCX) и анализирую их содержимое.\n"
+        "— Скачиваю видео с YouTube, TikTok и других сайтов. Просто пришли мне ссылку или используй /dl <ссылка>.\n"
         "— Если пришлёте фото с подписью, я запомню контекст.\n\n"
         "🔹 /clear — очистить историю\n"
-        "🔹 /history — показать историю"
+        "🔹 /history — показать историю\n"
+        "🔹 /dl <ссылка> — скачать видео"
     )
 
 @dp.message(Command("clear"))
@@ -108,6 +137,166 @@ async def cmd_clear(message: types.Message):
     if os.path.exists(file_path):
         os.remove(file_path)
     await message.reply("🧹 История диалога очищена.")
+
+@dp.message(Command("history"))
+async def cmd_history(message: types.Message):
+    user_id = message.from_user.id
+    history = await load_history(user_id)
+    if not history:
+        await message.reply("📭 История пуста.")
+        return
+    text = "📜 **Последние сообщения:**\n"
+    for msg in history[-6:]:
+        role = "👤" if msg["role"] == "user" else "🤖"
+        content = msg["content"][:100] + ("..." if len(msg["content"]) > 100 else "")
+        text += f"{role} {content}\n"
+    await message.reply(text)
+
+# === ОБРАБОТЧИК СКАЧИВАНИЯ ПО КОМАНДЕ ===
+@dp.message(Command("dl"))
+async def cmd_download(message: types.Message):
+    url = message.text.replace('/dl', '').strip()
+    if not url:
+        await message.reply("Пожалуйста, укажите ссылку после команды. Пример: /dl https://youtu.be/...")
+        return
+
+    await message.reply("⏳ Скачиваю видео, подождите...")
+    file_path = await download_video(url, message.from_user.id)
+
+    if file_path and os.path.exists(file_path):
+        try:
+            with open(file_path, 'rb') as video:
+                await bot.send_video(message.chat.id, video)
+        except Exception as e:
+            await message.reply(f"❌ Ошибка отправки видео: {e}")
+        finally:
+            os.remove(file_path)
+    else:
+        await message.reply("❌ Не удалось скачать видео. Возможно, ссылка недействительна или видео слишком большое.")
+
+# === ОБРАБОТЧИК ССЫЛОК В ТЕКСТЕ ===
+URL_REGEX = re.compile(r'(https?://[^\s]+)')
+
+@dp.message(lambda message: message.text and URL_REGEX.search(message.text))
+async def handle_url_message(message: types.Message):
+    urls = URL_REGEX.findall(message.text)
+    for url in urls:
+        if any(domain in url for domain in ['youtu.be', 'youtube.com', 'tiktok.com']):
+            await message.reply(f"🔗 Обнаружена ссылка. Скачиваю {url}...")
+            file_path = await download_video(url, message.from_user.id)
+
+            if file_path and os.path.exists(file_path):
+                try:
+                    with open(file_path, 'rb') as video:
+                        await bot.send_video(message.chat.id, video)
+                except Exception as e:
+                    await message.reply(f"❌ Ошибка отправки видео: {e}")
+                finally:
+                    os.remove(file_path)
+            else:
+                await message.reply("❌ Не удалось скачать видео.")
+            break  # Скачиваем только первое видео, чтобы не спамить
+
+# === ОБРАБОТЧИК ДОКУМЕНТОВ ===
+@dp.message(lambda message: message.document is not None)
+async def handle_document(message: types.Message):
+    user_id = message.from_user.id
+    await message.reply("📄 Читаю документ, подождите...")
+
+    try:
+        file_name, extracted_text = await process_document(message)
+        if not extracted_text:
+            await message.reply("❌ Не удалось извлечь текст из файла.")
+            return
+
+        max_chars = 5000
+        if len(extracted_text) > max_chars:
+            extracted_text = extracted_text[:max_chars] + "\n... (текст обрезан)"
+
+        prompt = f"Пользователь прислал файл '{file_name}' со следующим содержимым:\n\n{extracted_text}\n\nОтветь на вопросы по этому документу или дай краткое резюме."
+
+        history = await load_history(user_id)
+        history.append({"role": "user", "content": prompt})
+
+        response = await groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=history
+        )
+        reply = response.choices[0].message.content
+
+        history.append({"role": "assistant", "content": reply})
+        if len(history) > MAX_HISTORY_LENGTH:
+            history = history[-MAX_HISTORY_LENGTH:]
+        await save_history(user_id, history)
+
+        await message.reply(reply)
+
+    except ValueError as e:
+        await message.reply(f"❌ {str(e)}")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка обработки документа: {e}")
+
+# === ОБРАБОТЧИК ФОТО ===
+@dp.message(lambda message: message.photo is not None)
+async def handle_photo(message: types.Message):
+    user_id = message.from_user.id
+    caption = message.caption or ""
+
+    history = await load_history(user_id)
+
+    user_msg = f"[Пользователь прислал фото]"
+    if caption:
+        user_msg += f" с подписью: {caption}"
+    else:
+        user_msg += " без подписи."
+
+    history.append({"role": "user", "content": user_msg})
+
+    reply = "📷 Я получил ваше фото, но пока не умею анализировать изображения. Могу ответить на вопросы по тексту или документам."
+    history.append({"role": "assistant", "content": reply})
+
+    if len(history) > MAX_HISTORY_LENGTH:
+        history = history[-MAX_HISTORY_LENGTH:]
+
+    await save_history(user_id, history)
+    await message.reply(reply)
+
+# === ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ===
+@dp.message()
+async def handle_text(message: types.Message):
+    user_id = message.from_user.id
+    user_text = message.text
+
+    history = await load_history(user_id)
+    history.append({"role": "user", "content": user_text})
+
+    try:
+        response = await groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=history
+        )
+        reply = response.choices[0].message.content
+
+        history.append({"role": "assistant", "content": reply})
+        if len(history) > MAX_HISTORY_LENGTH:
+            history = history[-MAX_HISTORY_LENGTH:]
+
+        await save_history(user_id, history)
+        await message.reply(reply)
+
+    except Exception as e:
+        if history and history[-1]["role"] == "user":
+            history.pop()
+        await save_history(user_id, history)
+        await message.reply(f"❌ Ошибка: {e}")
+
+# === ЗАПУСК ===
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == '__main__':
+    print("Бот запущен...")
+    asyncio.run(main())    await message.reply("🧹 История диалога очищена.")
 
 @dp.message(Command("history"))
 async def cmd_history(message: types.Message):
