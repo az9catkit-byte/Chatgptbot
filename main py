@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import aiofiles
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -30,17 +31,44 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 # Папки
 DATA_DIR = "user_data"
 DOWNLOADS_DIR = "downloads"
+ACTIVITY_DIR = "user_activity"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+os.makedirs(ACTIVITY_DIR, exist_ok=True)
 
 MAX_HISTORY_LENGTH = 10
+ONLINE_THRESHOLD = 300  # 5 минут в секундах
 
-# === ХРАНЕНИЕ СЕССИЙ АДМИНИСТРАТОРА ===
+# === ХРАНЕНИЕ СЕССИЙ ===
 admin_sessions = set()
+control_sessions = {}  # admin_id -> user_id
 
-# === СОСТОЯНИЯ ДЛЯ FSM (ВВОД ПАРОЛЯ) ===
 class AdminAuth(StatesGroup):
     waiting_for_password = State()
+
+# === ФУНКЦИИ ДЛЯ АКТИВНОСТИ ===
+def get_activity_file_path(user_id: int) -> str:
+    return os.path.join(ACTIVITY_DIR, f"{user_id}.json")
+
+async def update_user_activity(user_id: int):
+    file_path = get_activity_file_path(user_id)
+    data = {"last_active": time.time()}
+    async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+        await f.write(json.dumps(data))
+
+async def get_all_users_activity() -> dict:
+    """Возвращает словарь {user_id: last_active_timestamp}"""
+    result = {}
+    for filename in os.listdir(ACTIVITY_DIR):
+        if filename.endswith('.json'):
+            user_id = int(filename.replace('.json', ''))
+            try:
+                async with aiofiles.open(os.path.join(ACTIVITY_DIR, filename), 'r') as f:
+                    data = json.loads(await f.read())
+                    result[user_id] = data.get("last_active", 0)
+            except:
+                pass
+    return result
 
 # === ФУНКЦИИ ДЛЯ ИСТОРИИ ===
 def get_user_file_path(user_id: int) -> str:
@@ -131,8 +159,9 @@ async def download_video(url: str, user_id: int) -> str | None:
 # === ХЕНДЛЕРЫ КОМАНД ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    await update_user_activity(message.from_user.id)
     await message.answer(
-        "👋 Привет! Я бот SkipperAI.\n\n"
+        "👋 Привет! Я бот с Groq и памятью в файлах.\n\n"
         "📝 **Возможности:**\n"
         "— Отвечаю на текстовые сообщения с учётом истории.\n"
         "— Принимаю документы (TXT, PDF, DOCX) и анализирую их содержимое.\n"
@@ -140,11 +169,12 @@ async def cmd_start(message: types.Message):
         "— Если пришлёте фото с подписью, я запомню контекст.\n\n"
         "🔹 /clear — очистить историю\n"
         "🔹 /history — показать историю\n"
-        "🔹 /dl <ссылка> — скачать видео\n"
+        "🔹 /dl <ссылка> — скачать видео"
     )
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: types.Message):
+    await update_user_activity(message.from_user.id)
     user_id = message.from_user.id
     file_path = get_user_file_path(user_id)
     if os.path.exists(file_path):
@@ -153,6 +183,7 @@ async def cmd_clear(message: types.Message):
 
 @dp.message(Command("history"))
 async def cmd_history(message: types.Message):
+    await update_user_activity(message.from_user.id)
     user_id = message.from_user.id
     history = await load_history(user_id)
     if not history:
@@ -168,31 +199,111 @@ async def cmd_history(message: types.Message):
 # === АДМИНИСТРАТИВНЫЙ ВХОД ПО КЛЮЧЕВОМУ СЛОВУ ===
 @dp.message(F.text.lower() == "administratormode")
 async def admin_mode_trigger(message: types.Message, state: FSMContext):
+    await update_user_activity(message.from_user.id)
     user_id = message.from_user.id
 
-    # Если уже админ — выходим
     if user_id in admin_sessions:
         admin_sessions.remove(user_id)
+        if user_id in control_sessions:
+            del control_sessions[user_id]
         await message.reply("🔓 Вы вышли из режима администратора.")
         return
 
-    # Иначе запрашиваем пароль
     await message.reply("🔐 Введите пароль администратора:")
     await state.set_state(AdminAuth.waiting_for_password)
 
 @dp.message(StateFilter(AdminAuth.waiting_for_password))
 async def process_password(message: types.Message, state: FSMContext):
+    await update_user_activity(message.from_user.id)
     user_id = message.from_user.id
     if message.text == ADMIN_PASSWORD:
         admin_sessions.add(user_id)
-        await message.reply("✅ Пароль верный. Вы вошли в режим администратора.\nДоступные команды:\n/users — список пользователей\n/history_admin <user_id> — история пользователя")
+        await message.reply(
+            "✅ Пароль верный. Вы вошли в режим администратора.\n\n"
+            "Доступные команды:\n"
+            "/users — список пользователей\n"
+            "/history_admin <user_id> — история пользователя\n"
+            "/control <user_id> — взять пользователя под ручное управление\n"
+            "/control stop — завершить управление\n"
+            "/online — список пользователей с онлайн-статусом"
+        )
     else:
         await message.reply("❌ Неверный пароль.")
     await state.clear()
 
-# Команда /users (только для админов) — ИСПРАВЛЕНО: Пользователь(ID)
+# === КОМАНДА УПРАВЛЕНИЯ /control ===
+@dp.message(Command("control"))
+async def cmd_control(message: types.Message):
+    await update_user_activity(message.from_user.id)
+    admin_id = message.from_user.id
+    if admin_id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
+    args = message.text.split()
+    if len(args) == 1:
+        if admin_id in control_sessions:
+            target = control_sessions[admin_id]
+            await message.reply(f"🔧 Вы управляете пользователем `{target}`. Для выхода: /control stop")
+        else:
+            await message.reply("ℹ️ Вы не управляете ни одним пользователем. Используйте /control <user_id>.")
+        return
+
+    if args[1].lower() == "stop":
+        if admin_id in control_sessions:
+            target = control_sessions.pop(admin_id)
+            await message.reply(f"🔓 Управление пользователем `{target}` завершено. ИИ снова активен.")
+        else:
+            await message.reply("ℹ️ Нет активного управления.")
+        return
+
+    try:
+        target_id = int(args[1])
+    except ValueError:
+        await message.reply("❌ ID пользователя должен быть числом.")
+        return
+
+    control_sessions[admin_id] = target_id
+    await message.reply(
+        f"🔧 Теперь вы управляете пользователем `{target_id}`.\n"
+        f"Все его сообщения будут пересылаться вам. Ваши сообщения будут отправляться ему.\n"
+        f"ИИ для этого пользователя отключён.\n"
+        f"Для выхода: /control stop"
+    )
+
+# === КОМАНДА /online (ТОЛЬКО ДЛЯ АДМИНОВ) ===
+@dp.message(Command("online"))
+async def cmd_online(message: types.Message):
+    await update_user_activity(message.from_user.id)
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
+    activities = await get_all_users_activity()
+    if not activities:
+        await message.reply("📭 Нет данных об активности пользователей.")
+        return
+
+    now = time.time()
+    lines = ["👥 **Статус пользователей:**\n"]
+    for user_id, last_active in sorted(activities.items(), key=lambda x: x[1], reverse=True):
+        delta = now - last_active
+        if delta < ONLINE_THRESHOLD:
+            status = "🟢 онлайн"
+        else:
+            status = "🔴 офлайн"
+        time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_active))
+        lines.append(f"• Пользователь(`{user_id}`): {status} (посл. {time_str})")
+
+    text = "\n".join(lines[:31])  # Ограничим 30 пользователей + заголовок
+    if len(lines) > 31:
+        text += f"\n... и ещё {len(lines)-31}"
+    await message.reply(text, parse_mode="Markdown")
+
+# Команда /users (только для админов)
 @dp.message(Command("users"))
 async def cmd_users(message: types.Message):
+    await update_user_activity(message.from_user.id)
     if message.from_user.id not in admin_sessions:
         await message.reply("⛔ У вас нет прав для этой команды.")
         return
@@ -212,9 +323,10 @@ async def cmd_users(message: types.Message):
     except Exception as e:
         await message.reply(f"❌ Ошибка при чтении списка пользователей: {e}")
 
-# Команда /history_admin <user_id> (только для админов) — ПОЛНЫЙ ТЕКСТ
+# Команда /history_admin <user_id> (только для админов)
 @dp.message(Command("history_admin"))
 async def cmd_history_admin(message: types.Message):
+    await update_user_activity(message.from_user.id)
     if message.from_user.id not in admin_sessions:
         await message.reply("⛔ У вас нет прав для этой команды.")
         return
@@ -235,16 +347,14 @@ async def cmd_history_admin(message: types.Message):
         await message.reply(f"📭 У пользователя {target_id} нет истории.")
         return
 
-    # Показываем последние 10 записей (5 вопросов-ответов)
     last_messages = history[-10:]
     text = f"📜 **История пользователя {target_id} (последние сообщения):**\n\n"
     
     for msg in last_messages:
-        role = "👤 Пользователь" if msg["role"] == "user" else "🤖 SkipperAI"
+        role = "👤 Пользователь" if msg["role"] == "user" else "🤖 Бот"
         content = msg["content"]
         text += f"{role}:\n{content}\n\n"
     
-    # Разбиваем на части, если сообщение слишком длинное (лимит Telegram — 4096 символов)
     if len(text) > 4000:
         for i in range(0, len(text), 4000):
             await message.reply(text[i:i+4000])
@@ -254,6 +364,7 @@ async def cmd_history_admin(message: types.Message):
 # === ОБРАБОТЧИК СКАЧИВАНИЯ ПО КОМАНДЕ ===
 @dp.message(Command("dl"))
 async def cmd_download(message: types.Message):
+    await update_user_activity(message.from_user.id)
     url = message.text.replace('/dl', '').strip()
     if not url:
         await message.reply("Пожалуйста, укажите ссылку после команды. Пример: /dl https://youtu.be/...")
@@ -278,6 +389,11 @@ URL_REGEX = re.compile(r'(https?://[^\s]+)')
 
 @dp.message(lambda message: message.text and URL_REGEX.search(message.text))
 async def handle_url_message(message: types.Message):
+    await update_user_activity(message.from_user.id)
+
+    if message.from_user.id in admin_sessions and message.from_user.id in control_sessions:
+        return
+
     urls = URL_REGEX.findall(message.text)
     for url in urls:
         if any(domain in url for domain in ['youtu.be', 'youtube.com', 'tiktok.com']):
@@ -300,6 +416,14 @@ async def handle_url_message(message: types.Message):
 @dp.message(lambda message: message.document is not None)
 async def handle_document(message: types.Message):
     user_id = message.from_user.id
+    await update_user_activity(user_id)
+
+    for admin_id, target_id in control_sessions.items():
+        if user_id == target_id:
+            await bot.send_document(admin_id, message.document.file_id, caption=f"📎 Документ от пользователя {user_id}")
+            await message.reply("📄 Документ получен. Администратор скоро ответит.")
+            return
+
     await message.reply("📄 Читаю документ, подождите...")
 
     try:
@@ -339,8 +463,18 @@ async def handle_document(message: types.Message):
 @dp.message(lambda message: message.photo is not None)
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
-    caption = message.caption or ""
+    await update_user_activity(user_id)
 
+    for admin_id, target_id in control_sessions.items():
+        if user_id == target_id:
+            caption = f"📷 Фото от пользователя {user_id}"
+            if message.caption:
+                caption += f"\nПодпись: {message.caption}"
+            await bot.send_photo(admin_id, message.photo[-1].file_id, caption=caption)
+            await message.reply("📷 Фото получено. Администратор скоро ответит.")
+            return
+
+    caption = message.caption or ""
     history = await load_history(user_id)
 
     user_msg = f"[Пользователь прислал фото]"
@@ -360,12 +494,31 @@ async def handle_photo(message: types.Message):
     await save_history(user_id, history)
     await message.reply(reply)
 
-# === ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ===
+# === ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (ОСНОВНОЙ) ===
 @dp.message()
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
-    user_text = message.text
+    await update_user_activity(user_id)
 
+    # Сообщение от админа, управляющего пользователем
+    if user_id in admin_sessions and user_id in control_sessions:
+        target_id = control_sessions[user_id]
+        try:
+            await bot.send_message(target_id, message.text)
+            await message.reply(f"✅ Сообщение отправлено пользователю `{target_id}`.")
+        except Exception as e:
+            await message.reply(f"❌ Не удалось отправить сообщение: {e}")
+        return
+
+    # Сообщение от управляемого пользователя
+    for admin_id, target_id in control_sessions.items():
+        if user_id == target_id:
+            await bot.send_message(admin_id, f"💬 Сообщение от пользователя `{user_id}`:\n\n{message.text}")
+            await message.reply("📨 Ваше сообщение передано администратору. Ожидайте ответа.")
+            return
+
+    # Обычное сообщение → ИИ
+    user_text = message.text
     history = await load_history(user_id)
     history.append({"role": "user", "content": user_text})
 
