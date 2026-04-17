@@ -11,8 +11,8 @@ from docx import Document
 import yt_dlp
 
 # === НАСТРОЙКИ (БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ) ===
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("8603687714:AAFlbmp3AnUOp489DSv0FBpUv1CZIHkxzRM")
+GROQ_API_KEY = os.getenv("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")
 
 if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError("Не заданы TELEGRAM_BOT_TOKEN или GROQ_API_KEY в переменных окружения")
