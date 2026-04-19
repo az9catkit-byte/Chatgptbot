@@ -28,7 +28,7 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
-# Папки и файлы для хранения данных
+# Папки и файлы
 DATA_DIR = "user_data"
 DOWNLOADS_DIR = "downloads"
 ACTIVITY_DIR = "user_activity"
@@ -38,19 +38,17 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(ACTIVITY_DIR, exist_ok=True)
 
 MAX_HISTORY_LENGTH = 10
-ONLINE_THRESHOLD = 300  # 5 минут в секундах
+ONLINE_THRESHOLD = 300
 
-# === ХРАНЕНИЕ СЕССИЙ ===
 admin_sessions = set()
-control_sessions = {}  # admin_id -> user_id (для пользователей)
-group_control_sessions = {}  # admin_id -> chat_id (для групп)
+control_sessions = {}
+group_control_sessions = {}
 
 class AdminAuth(StatesGroup):
     waiting_for_password = State()
 
-# === ФУНКЦИИ ДЛЯ РАБОТЫ С ГРУППАМИ ===
+# === ФУНКЦИИ ДЛЯ ГРУПП ===
 async def save_group_info(chat: types.Chat):
-    """Сохраняет информацию о группе в JSON-файл."""
     groups = {}
     if os.path.exists(GROUPS_FILE):
         async with aiofiles.open(GROUPS_FILE, 'r', encoding='utf-8') as f:
@@ -58,19 +56,16 @@ async def save_group_info(chat: types.Chat):
                 groups = json.loads(await f.read())
             except json.JSONDecodeError:
                 groups = {}
-    
     groups[str(chat.id)] = {
         "id": chat.id,
         "title": chat.title or "Без названия",
         "type": chat.type,
         "added_at": time.time()
     }
-    
     async with aiofiles.open(GROUPS_FILE, 'w', encoding='utf-8') as f:
         await f.write(json.dumps(groups, ensure_ascii=False, indent=2))
 
 async def get_all_groups() -> dict:
-    """Возвращает словарь со всеми сохранёнными группами."""
     if not os.path.exists(GROUPS_FILE):
         return {}
     async with aiofiles.open(GROUPS_FILE, 'r', encoding='utf-8') as f:
@@ -79,7 +74,7 @@ async def get_all_groups() -> dict:
         except json.JSONDecodeError:
             return {}
 
-# === ФУНКЦИИ ДЛЯ АКТИВНОСТИ ===
+# === АКТИВНОСТЬ ===
 def get_activity_file_path(user_id: int) -> str:
     return os.path.join(ACTIVITY_DIR, f"{user_id}.json")
 
@@ -102,7 +97,7 @@ async def get_all_users_activity() -> dict:
                 pass
     return result
 
-# === ФУНКЦИИ ДЛЯ ИСТОРИИ ===
+# === ИСТОРИЯ ===
 def get_user_file_path(user_id: int) -> str:
     return os.path.join(DATA_DIR, f"{user_id}.json")
 
@@ -122,7 +117,7 @@ async def save_history(user_id: int, history: list):
     async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
         await f.write(json.dumps(history, ensure_ascii=False, indent=2))
 
-# === ФУНКЦИИ ДЛЯ ЧТЕНИЯ ФАЙЛОВ ===
+# === ФАЙЛЫ ===
 async def download_file(file_id: str, destination: str):
     file = await bot.get_file(file_id)
     await bot.download_file(file.file_path, destination)
@@ -148,9 +143,7 @@ async def process_document(message: types.Message) -> tuple[str, str]:
     file_name = document.file_name.lower()
     file_id = document.file_id
     file_path = os.path.join(DOWNLOADS_DIR, f"{message.from_user.id}_{file_id}_{file_name}")
-
     await download_file(file_id, file_path)
-
     extracted_text = ""
     if file_name.endswith('.txt'):
         extracted_text = extract_text_from_txt(file_path)
@@ -161,11 +154,10 @@ async def process_document(message: types.Message) -> tuple[str, str]:
     else:
         os.remove(file_path)
         raise ValueError("Неподдерживаемый формат. Можно: TXT, PDF, DOCX.")
-
     os.remove(file_path)
     return file_name, extracted_text.strip()
 
-# === ФУНКЦИЯ ДЛЯ СКАЧИВАНИЯ ВИДЕО ===
+# === ВИДЕО ===
 async def download_video(url: str, user_id: int) -> str | None:
     ydl_opts = {
         'format': 'best[height<=720]',
@@ -188,33 +180,34 @@ async def download_video(url: str, user_id: int) -> str | None:
         print(f"Ошибка скачивания: {e}")
         return None
 
-# === ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: ПРОВЕРКА УПОМИНАНИЯ БОТА ===
-def is_bot_mentioned(message: types.Message) -> bool:
+# === УПОМИНАНИЕ БОТА ===
+async def is_bot_mentioned(message: types.Message) -> bool:
+    bot_username = (await bot.me()).username
     if message.reply_to_message and message.reply_to_message.from_user.id == bot.id:
         return True
     if message.entities:
         for entity in message.entities:
             if entity.type == "mention":
                 mention = message.text[entity.offset:entity.offset+entity.length]
-                if mention == f"@{bot._me.username}":
+                if mention == f"@{bot_username}":
                     return True
-    if f"@{bot._me.username}" in message.text:
+    if f"@{bot_username}" in message.text:
         return True
     return False
 
-# === ПРИВЕТСТВИЕ ПРИ ДОБАВЛЕНИИ В ГРУППУ ===
+# === ПРИВЕТСТВИЕ В ГРУППЕ ===
 @dp.message(F.new_chat_members)
 async def on_bot_added_to_group(message: types.Message):
     for member in message.new_chat_members:
         if member.id == bot.id:
             await save_group_info(message.chat)
+            bot_username = (await bot.me()).username
             await message.answer(
-                "👋 Привет! Я бот с Groq и памятью.\n"
-                "В группах я отвечаю только если вы упомянете меня (@username) или ответите на моё сообщение.\n"
-                "Все команды администратора работают только в личных сообщениях со мной."
+                f"👋 Привет! Я бот с Groq и памятью.\n"
+                f"В группах я отвечаю только если вы упомянете меня (@{bot_username}) или ответите на моё сообщение."
             )
 
-# === ХЕНДЛЕРЫ КОМАНД (ОБЩИЕ) ===
+# === ОБЩИЕ КОМАНДЫ ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await update_user_activity(message.from_user.id)
@@ -256,14 +249,13 @@ async def cmd_history(message: types.Message):
         text += f"{role} {content}\n"
     await message.reply(text)
 
-# === АДМИНИСТРАТИВНЫЙ ВХОД (ТОЛЬКО В ЛИЧКЕ) ===
+# === АДМИН-ВХОД ===
 @dp.message(F.text.lower() == "administratormode")
 async def admin_mode_trigger(message: types.Message, state: FSMContext):
     await update_user_activity(message.from_user.id)
     if message.chat.type != "private":
         await message.reply("⛔ Режим администратора доступен только в личных сообщениях.")
         return
-
     user_id = message.from_user.id
     if user_id in admin_sessions:
         admin_sessions.remove(user_id)
@@ -273,7 +265,6 @@ async def admin_mode_trigger(message: types.Message, state: FSMContext):
             del group_control_sessions[user_id]
         await message.reply("🔓 Вы вышли из режима администратора.")
         return
-
     await message.reply("🔐 Введите пароль администратора:")
     await state.set_state(AdminAuth.waiting_for_password)
 
@@ -283,7 +274,6 @@ async def process_password(message: types.Message, state: FSMContext):
     if message.chat.type != "private":
         await state.clear()
         return
-
     user_id = message.from_user.id
     if message.text == ADMIN_PASSWORD:
         admin_sessions.add(user_id)
@@ -293,7 +283,7 @@ async def process_password(message: types.Message, state: FSMContext):
             "/users — список пользователей\n"
             "/history_admin <user_id> — история пользователя\n"
             "/control <user_id> — взять пользователя под ручное управление\n"
-            "/control stop — завершить управление\n"
+            "/control stop — завершить управление пользователем\n"
             "/online — список пользователей с онлайн-статусом\n"
             "/groups — список групп бота\n"
             "/group_connect <chat_id> — управлять группой\n"
@@ -303,7 +293,6 @@ async def process_password(message: types.Message, state: FSMContext):
         await message.reply("❌ Неверный пароль.")
     await state.clear()
 
-# === КОМАНДЫ АДМИНИСТРАТОРА (ТОЛЬКО В ЛИЧКЕ) ===
 def require_private_and_admin(func):
     async def wrapper(message: types.Message, *args, **kwargs):
         await update_user_activity(message.from_user.id)
@@ -328,7 +317,6 @@ async def cmd_control(message: types.Message):
         else:
             await message.reply("ℹ️ Вы не управляете ни одним пользователем. Используйте /control <user_id>.")
         return
-
     if args[1].lower() == "stop":
         if admin_id in control_sessions:
             target = control_sessions.pop(admin_id)
@@ -336,13 +324,11 @@ async def cmd_control(message: types.Message):
         else:
             await message.reply("ℹ️ Нет активного управления.")
         return
-
     try:
         target_id = int(args[1])
     except ValueError:
         await message.reply("❌ ID пользователя должен быть числом.")
         return
-
     control_sessions[admin_id] = target_id
     await message.reply(
         f"🔧 Теперь вы управляете пользователем `{target_id}`.\n"
@@ -358,7 +344,6 @@ async def cmd_online(message: types.Message):
     if not activities:
         await message.reply("📭 Нет данных об активности пользователей.")
         return
-
     now = time.time()
     lines = ["👥 **Статус пользователей:**\n"]
     for user_id, last_active in sorted(activities.items(), key=lambda x: x[1], reverse=True):
@@ -369,7 +354,6 @@ async def cmd_online(message: types.Message):
             status = "🔴 офлайн"
         time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_active))
         lines.append(f"• Пользователь(`{user_id}`): {status} (посл. {time_str})")
-
     text = "\n".join(lines[:31])
     if len(lines) > 31:
         text += f"\n... и ещё {len(lines)-31}"
@@ -400,32 +384,27 @@ async def cmd_history_admin(message: types.Message):
     if len(args) != 2:
         await message.reply("Используйте: /history_admin <user_id>")
         return
-
     try:
         target_id = int(args[1])
     except ValueError:
         await message.reply("ID пользователя должен быть числом.")
         return
-
     history = await load_history(target_id)
     if not history:
         await message.reply(f"📭 У пользователя {target_id} нет истории.")
         return
-
     last_messages = history[-10:]
     text = f"📜 **История пользователя {target_id} (последние сообщения):**\n\n"
     for msg in last_messages:
         role = "👤 Пользователь" if msg["role"] == "user" else "🤖 Бот"
         content = msg["content"]
         text += f"{role}:\n{content}\n\n"
-
     if len(text) > 4000:
         for i in range(0, len(text), 4000):
             await message.reply(text[i:i+4000])
     else:
         await message.reply(text)
 
-# === НОВЫЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ ГРУППАМИ ===
 @dp.message(Command("groups"))
 @require_private_and_admin
 async def cmd_groups(message: types.Message):
@@ -433,11 +412,9 @@ async def cmd_groups(message: types.Message):
     if not groups:
         await message.reply("📭 Бот пока не добавлен ни в одну группу.")
         return
-
     text = "👥 **Группы, в которых состоит бот:**\n\n"
     for chat_id, info in groups.items():
         text += f"• `{chat_id}`: {info.get('title', 'Без названия')}\n"
-    
     if len(text) > 4000:
         for i in range(0, len(text), 4000):
             await message.reply(text[i:i+4000], parse_mode="Markdown")
@@ -456,7 +433,6 @@ async def cmd_group_connect(message: types.Message):
         else:
             await message.reply("ℹ️ Вы не управляете ни одной группой. Используйте /group_connect <chat_id>.")
         return
-
     if args[1].lower() == "stop":
         if admin_id in group_control_sessions:
             target = group_control_sessions.pop(admin_id)
@@ -464,18 +440,11 @@ async def cmd_group_connect(message: types.Message):
         else:
             await message.reply("ℹ️ Нет активного управления.")
         return
-
     try:
         chat_id = int(args[1])
     except ValueError:
         await message.reply("❌ ID группы должен быть числом.")
         return
-
-    # Проверяем, что такая группа есть в сохранённых
-    groups = await get_all_groups()
-    if str(chat_id) not in groups:
-        await message.reply(f"⚠️ Группа `{chat_id}` не найдена в списке сохранённых. Управление всё равно активировано.")
-
     group_control_sessions[admin_id] = chat_id
     await message.reply(
         f"🔧 Теперь вы управляете группой `{chat_id}`.\n"
@@ -484,7 +453,7 @@ async def cmd_group_connect(message: types.Message):
         f"Для выхода: /group_connect stop"
     )
 
-# === ОБРАБОТЧИК СКАЧИВАНИЯ ПО КОМАНДЕ ===
+# === СКАЧИВАНИЕ ВИДЕО ===
 @dp.message(Command("dl"))
 async def cmd_download(message: types.Message):
     await update_user_activity(message.from_user.id)
@@ -492,10 +461,8 @@ async def cmd_download(message: types.Message):
     if not url:
         await message.reply("Пожалуйста, укажите ссылку после команды. Пример: /dl https://youtu.be/...")
         return
-
     await message.reply("⏳ Скачиваю видео, подождите...")
     file_path = await download_video(url, message.from_user.id)
-
     if file_path and os.path.exists(file_path):
         try:
             with open(file_path, 'rb') as video:
@@ -505,27 +472,23 @@ async def cmd_download(message: types.Message):
         finally:
             os.remove(file_path)
     else:
-        await message.reply("❌ Не удалось скачать видео. Возможно, ссылка недействительна или видео слишком большое.")
+        await message.reply("❌ Не удалось скачать видео.")
 
-# === ОБРАБОТЧИК ССЫЛОК В ТЕКСТЕ ===
+# === ССЫЛКИ ===
 URL_REGEX = re.compile(r'(https?://[^\s]+)')
 
 @dp.message(lambda message: message.text and URL_REGEX.search(message.text))
 async def handle_url_message(message: types.Message):
     await update_user_activity(message.from_user.id)
-
-    if message.chat.type != "private" and not is_bot_mentioned(message):
+    if message.chat.type != "private" and not await is_bot_mentioned(message):
         return
-
     if message.from_user.id in admin_sessions and message.from_user.id in control_sessions:
         return
-
     urls = URL_REGEX.findall(message.text)
     for url in urls:
         if any(domain in url for domain in ['youtu.be', 'youtube.com', 'tiktok.com']):
             await message.reply(f"🔗 Обнаружена ссылка. Скачиваю {url}...")
             file_path = await download_video(url, message.from_user.id)
-
             if file_path and os.path.exists(file_path):
                 try:
                     with open(file_path, 'rb') as video:
@@ -538,24 +501,20 @@ async def handle_url_message(message: types.Message):
                 await message.reply("❌ Не удалось скачать видео.")
             break
 
-# === ОБРАБОТЧИК ДОКУМЕНТОВ ===
+# === ДОКУМЕНТЫ ===
 @dp.message(lambda message: message.document is not None)
 async def handle_document(message: types.Message):
     user_id = message.from_user.id
     await update_user_activity(user_id)
-
     if message.chat.type != "private":
         await save_group_info(message.chat)
-        if not is_bot_mentioned(message):
+        if not await is_bot_mentioned(message):
             return
-
     for admin_id, target_id in control_sessions.items():
         if user_id == target_id:
             await bot.send_document(admin_id, message.document.file_id, caption=f"📎 Документ от пользователя {user_id}")
             await message.reply("📄 Документ получен. Администратор скоро ответит.")
             return
-
-    # Обработка для группового управления
     for admin_id, target_chat_id in group_control_sessions.items():
         if message.chat.id == target_chat_id:
             sender_name = message.from_user.full_name or "Неизвестный"
@@ -564,53 +523,42 @@ async def handle_document(message: types.Message):
             await bot.forward_message(admin_id, message.chat.id, message.message_id)
             await message.reply("📄 Документ передан администратору.")
             return
-
     await message.reply("📄 Читаю документ, подождите...")
-
     try:
         file_name, extracted_text = await process_document(message)
         if not extracted_text:
             await message.reply("❌ Не удалось извлечь текст из файла.")
             return
-
         max_chars = 5000
         if len(extracted_text) > max_chars:
             extracted_text = extracted_text[:max_chars] + "\n... (текст обрезан)"
-
         prompt = f"Пользователь прислал файл '{file_name}' со следующим содержимым:\n\n{extracted_text}\n\nОтветь на вопросы по этому документу или дай краткое резюме."
-
         history = await load_history(user_id)
         history.append({"role": "user", "content": prompt})
-
         response = await groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=history
         )
         reply = response.choices[0].message.content
-
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY_LENGTH:
             history = history[-MAX_HISTORY_LENGTH:]
         await save_history(user_id, history)
-
         await message.reply(reply)
-
     except ValueError as e:
         await message.reply(f"❌ {str(e)}")
     except Exception as e:
         await message.reply(f"❌ Ошибка обработки документа: {e}")
 
-# === ОБРАБОТЧИК ФОТО ===
+# === ФОТО ===
 @dp.message(lambda message: message.photo is not None)
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
     await update_user_activity(user_id)
-
     if message.chat.type != "private":
         await save_group_info(message.chat)
-        if not is_bot_mentioned(message):
+        if not await is_bot_mentioned(message):
             return
-
     for admin_id, target_id in control_sessions.items():
         if user_id == target_id:
             caption = f"📷 Фото от пользователя {user_id}"
@@ -619,8 +567,6 @@ async def handle_photo(message: types.Message):
             await bot.send_photo(admin_id, message.photo[-1].file_id, caption=caption)
             await message.reply("📷 Фото получено. Администратор скоро ответит.")
             return
-
-    # Обработка для группового управления
     for admin_id, target_chat_id in group_control_sessions.items():
         if message.chat.id == target_chat_id:
             sender_name = message.from_user.full_name or "Неизвестный"
@@ -629,39 +575,30 @@ async def handle_photo(message: types.Message):
             await bot.forward_message(admin_id, message.chat.id, message.message_id)
             await message.reply("📷 Фото передано администратору.")
             return
-
     caption = message.caption or ""
     history = await load_history(user_id)
-
     user_msg = f"[Пользователь прислал фото]"
     if caption:
         user_msg += f" с подписью: {caption}"
     else:
         user_msg += " без подписи."
-
     history.append({"role": "user", "content": user_msg})
-
     reply = "📷 Я получил ваше фото, но пока не умею анализировать изображения. Могу ответить на вопросы по тексту или документам."
     history.append({"role": "assistant", "content": reply})
-
     if len(history) > MAX_HISTORY_LENGTH:
         history = history[-MAX_HISTORY_LENGTH:]
-
     await save_history(user_id, history)
     await message.reply(reply)
 
-# === ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (ОСНОВНОЙ) ===
+# === ТЕКСТ ===
 @dp.message()
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
     await update_user_activity(user_id)
-
     if message.chat.type != "private":
         await save_group_info(message.chat)
-        if not is_bot_mentioned(message):
+        if not await is_bot_mentioned(message):
             return
-
-    # Сообщение от админа, управляющего пользователем
     if user_id in admin_sessions and user_id in control_sessions:
         target_id = control_sessions[user_id]
         try:
@@ -670,8 +607,6 @@ async def handle_text(message: types.Message):
         except Exception as e:
             await message.reply(f"❌ Не удалось отправить сообщение: {e}")
         return
-
-    # Сообщение от админа, управляющего группой
     if user_id in admin_sessions and user_id in group_control_sessions:
         target_chat_id = group_control_sessions[user_id]
         try:
@@ -680,15 +615,11 @@ async def handle_text(message: types.Message):
         except Exception as e:
             await message.reply(f"❌ Не удалось отправить сообщение в группу: {e}")
         return
-
-    # Сообщение от управляемого пользователя
     for admin_id, target_id in control_sessions.items():
         if user_id == target_id:
             await bot.send_message(admin_id, f"💬 Сообщение от пользователя `{user_id}`:\n\n{message.text}")
             await message.reply("📨 Ваше сообщение передано администратору. Ожидайте ответа.")
             return
-
-    # Сообщение из управляемой группы
     for admin_id, target_chat_id in group_control_sessions.items():
         if message.chat.id == target_chat_id:
             sender_name = message.from_user.full_name or "Неизвестный"
@@ -696,26 +627,20 @@ async def handle_text(message: types.Message):
             await bot.send_message(admin_id, header + message.text)
             await message.reply("📨 Сообщение передано администратору.")
             return
-
-    # Обычный ответ через ИИ
     user_text = message.text
     history = await load_history(user_id)
     history.append({"role": "user", "content": user_text})
-
     try:
         response = await groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=history
         )
         reply = response.choices[0].message.content
-
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY_LENGTH:
             history = history[-MAX_HISTORY_LENGTH:]
-
         await save_history(user_id, history)
         await message.reply(reply)
-
     except Exception as e:
         if history and history[-1]["role"] == "user":
             history.pop()
