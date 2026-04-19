@@ -182,7 +182,10 @@ async def download_video(url: str, user_id: int) -> str | None:
 
 # === УПОМИНАНИЕ БОТА ===
 async def is_bot_mentioned(message: types.Message) -> bool:
-    bot_username = (await bot.me()).username
+    try:
+        bot_username = (await bot.me()).username
+    except:
+        return False
     if message.reply_to_message and message.reply_to_message.from_user.id == bot.id:
         return True
     if message.entities:
@@ -191,7 +194,7 @@ async def is_bot_mentioned(message: types.Message) -> bool:
                 mention = message.text[entity.offset:entity.offset+entity.length]
                 if mention == f"@{bot_username}":
                     return True
-    if f"@{bot_username}" in message.text:
+    if message.text and f"@{bot_username}" in message.text:
         return True
     return False
 
@@ -293,6 +296,7 @@ async def process_password(message: types.Message, state: FSMContext):
         await message.reply("❌ Неверный пароль.")
     await state.clear()
 
+# === ИСПРАВЛЕННЫЙ ДЕКОРАТОР ===
 def require_private_and_admin(func):
     async def wrapper(message: types.Message, *args, **kwargs):
         await update_user_activity(message.from_user.id)
