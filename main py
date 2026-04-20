@@ -32,6 +32,7 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 DATA_DIR = "user_data"
 DOWNLOADS_DIR = "downloads"
 ACTIVITY_DIR = "user_activity"
+GROUPS_FILE = "groups.json"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(ACTIVITY_DIR, exist_ok=True)
@@ -41,10 +42,38 @@ ONLINE_THRESHOLD = 300  # 5 минут в секундах
 
 # === ХРАНЕНИЕ СЕССИЙ ===
 admin_sessions = set()
-control_sessions = {}  # admin_id -> user_id
+control_sessions = {}        # admin_id -> user_id (управление пользователями)
+group_control_sessions = {}  # admin_id -> chat_id (управление группами)
 
 class AdminAuth(StatesGroup):
     waiting_for_password = State()
+
+# === ФУНКЦИИ ДЛЯ СОХРАНЕНИЯ ГРУПП ===
+async def save_group_info(chat: types.Chat):
+    groups = {}
+    if os.path.exists(GROUPS_FILE):
+        async with aiofiles.open(GROUPS_FILE, 'r', encoding='utf-8') as f:
+            try:
+                groups = json.loads(await f.read())
+            except json.JSONDecodeError:
+                groups = {}
+    groups[str(chat.id)] = {
+        "id": chat.id,
+        "title": chat.title or "Без названия",
+        "type": chat.type,
+        "added_at": time.time()
+    }
+    async with aiofiles.open(GROUPS_FILE, 'w', encoding='utf-8') as f:
+        await f.write(json.dumps(groups, ensure_ascii=False, indent=2))
+
+async def get_all_groups() -> dict:
+    if not os.path.exists(GROUPS_FILE):
+        return {}
+    async with aiofiles.open(GROUPS_FILE, 'r', encoding='utf-8') as f:
+        try:
+            return json.loads(await f.read())
+        except json.JSONDecodeError:
+            return {}
 
 # === ФУНКЦИИ ДЛЯ АКТИВНОСТИ ===
 def get_activity_file_path(user_id: int) -> str:
@@ -156,10 +185,40 @@ async def download_video(url: str, user_id: int) -> str | None:
         print(f"Ошибка скачивания: {e}")
         return None
 
+# === НОВАЯ ФУНКЦИЯ ПРОВЕРКИ УПОМИНАНИЯ БОТА ===
+async def is_bot_mentioned(message: types.Message) -> bool:
+    """Проверяет, упомянут ли бот через @username или ответом на его сообщение."""
+    try:
+        bot_username = (await bot.me()).username
+    except:
+        return False
+
+    if message.reply_to_message and message.reply_to_message.from_user.id == bot.id:
+        return True
+
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "mention":
+                mention = message.text[entity.offset:entity.offset+entity.length]
+                if mention == f"@{bot_username}":
+                    return True
+
+    if message.text and f"@{bot_username}" in message.text:
+        return True
+
+    return False
+
+def clean_text_from_mention(text: str, bot_username: str) -> str:
+    """Удаляет из текста упоминание @username."""
+    pattern = rf"@{re.escape(bot_username)}\s*"
+    return re.sub(pattern, "", text).strip()
+
 # === ХЕНДЛЕРЫ КОМАНД ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await update_user_activity(message.from_user.id)
+    if message.chat.type != "private":
+        await save_group_info(message.chat)
     await message.answer(
         "👋 Привет! Я бот с Groq и памятью в файлах.\n\n"
         "📝 **Возможности:**\n"
@@ -202,10 +261,16 @@ async def admin_mode_trigger(message: types.Message, state: FSMContext):
     await update_user_activity(message.from_user.id)
     user_id = message.from_user.id
 
+    if message.chat.type != "private":
+        await message.reply("⛔ Режим администратора доступен только в личных сообщениях.")
+        return
+
     if user_id in admin_sessions:
         admin_sessions.remove(user_id)
         if user_id in control_sessions:
             del control_sessions[user_id]
+        if user_id in group_control_sessions:
+            del group_control_sessions[user_id]
         await message.reply("🔓 Вы вышли из режима администратора.")
         return
 
@@ -216,6 +281,11 @@ async def admin_mode_trigger(message: types.Message, state: FSMContext):
 async def process_password(message: types.Message, state: FSMContext):
     await update_user_activity(message.from_user.id)
     user_id = message.from_user.id
+
+    if message.chat.type != "private":
+        await state.clear()
+        return
+
     if message.text == ADMIN_PASSWORD:
         admin_sessions.add(user_id)
         await message.reply(
@@ -224,20 +294,26 @@ async def process_password(message: types.Message, state: FSMContext):
             "/users — список пользователей\n"
             "/history_admin <user_id> — история пользователя\n"
             "/control <user_id> — взять пользователя под ручное управление\n"
-            "/control stop — завершить управление\n"
-            "/online — список пользователей с онлайн-статусом"
+            "/control stop — завершить управление пользователем\n"
+            "/online — список пользователей с онлайн-статусом\n"
+            "/groups — список групп, где есть бот\n"
+            "/group_connect <chat_id> — управлять группой\n"
+            "/group_connect stop — завершить управление группой"
         )
     else:
         await message.reply("❌ Неверный пароль.")
     await state.clear()
 
-# === КОМАНДА УПРАВЛЕНИЯ /control ===
+# === КОМАНДА УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЯМИ /control ===
 @dp.message(Command("control"))
 async def cmd_control(message: types.Message):
     await update_user_activity(message.from_user.id)
     admin_id = message.from_user.id
     if admin_id not in admin_sessions:
         await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+    if message.chat.type != "private":
+        await message.reply("⛔ Управление доступно только в личных сообщениях.")
         return
 
     args = message.text.split()
@@ -271,12 +347,15 @@ async def cmd_control(message: types.Message):
         f"Для выхода: /control stop"
     )
 
-# === КОМАНДА /online (ТОЛЬКО ДЛЯ АДМИНОВ) ===
+# === КОМАНДА /online (ТОЛЬКО ДЛЯ АДМИНОВ, ТОЛЬКО В ЛИЧКЕ) ===
 @dp.message(Command("online"))
 async def cmd_online(message: types.Message):
     await update_user_activity(message.from_user.id)
     if message.from_user.id not in admin_sessions:
         await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+    if message.chat.type != "private":
+        await message.reply("⛔ Команда доступна только в личных сообщениях.")
         return
 
     activities = await get_all_users_activity()
@@ -295,17 +374,20 @@ async def cmd_online(message: types.Message):
         time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_active))
         lines.append(f"• Пользователь(`{user_id}`): {status} (посл. {time_str})")
 
-    text = "\n".join(lines[:31])  # Ограничим 30 пользователей + заголовок
+    text = "\n".join(lines[:31])
     if len(lines) > 31:
         text += f"\n... и ещё {len(lines)-31}"
     await message.reply(text, parse_mode="Markdown")
 
-# Команда /users (только для админов)
+# Команда /users (только для админов, только в личке)
 @dp.message(Command("users"))
 async def cmd_users(message: types.Message):
     await update_user_activity(message.from_user.id)
     if message.from_user.id not in admin_sessions:
         await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+    if message.chat.type != "private":
+        await message.reply("⛔ Команда доступна только в личных сообщениях.")
         return
 
     try:
@@ -323,12 +405,15 @@ async def cmd_users(message: types.Message):
     except Exception as e:
         await message.reply(f"❌ Ошибка при чтении списка пользователей: {e}")
 
-# Команда /history_admin <user_id> (только для админов)
+# Команда /history_admin <user_id> (только для админов, только в личке)
 @dp.message(Command("history_admin"))
 async def cmd_history_admin(message: types.Message):
     await update_user_activity(message.from_user.id)
     if message.from_user.id not in admin_sessions:
         await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+    if message.chat.type != "private":
+        await message.reply("⛔ Команда доступна только в личных сообщениях.")
         return
 
     args = message.text.split()
@@ -361,10 +446,80 @@ async def cmd_history_admin(message: types.Message):
     else:
         await message.reply(text)
 
+# === НОВЫЕ КОМАНДЫ ДЛЯ ГРУПП ===
+@dp.message(Command("groups"))
+async def cmd_groups(message: types.Message):
+    await update_user_activity(message.from_user.id)
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+    if message.chat.type != "private":
+        await message.reply("⛔ Команда доступна только в личных сообщениях.")
+        return
+
+    groups = await get_all_groups()
+    if not groups:
+        await message.reply("📭 Бот пока не добавлен ни в одну группу.")
+        return
+
+    text = "👥 **Группы, в которых состоит бот:**\n\n"
+    for chat_id, info in groups.items():
+        text += f"• `{chat_id}`: {info.get('title', 'Без названия')}\n"
+    
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await message.reply(text[i:i+4000], parse_mode="Markdown")
+    else:
+        await message.reply(text, parse_mode="Markdown")
+
+@dp.message(Command("group_connect"))
+async def cmd_group_connect(message: types.Message):
+    await update_user_activity(message.from_user.id)
+    admin_id = message.from_user.id
+    if admin_id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+    if message.chat.type != "private":
+        await message.reply("⛔ Команда доступна только в личных сообщениях.")
+        return
+
+    args = message.text.split()
+    if len(args) == 1:
+        if admin_id in group_control_sessions:
+            target = group_control_sessions[admin_id]
+            await message.reply(f"🔧 Вы управляете группой `{target}`. Для выхода: /group_connect stop")
+        else:
+            await message.reply("ℹ️ Вы не управляете ни одной группой. Используйте /group_connect <chat_id>.")
+        return
+
+    if args[1].lower() == "stop":
+        if admin_id in group_control_sessions:
+            target = group_control_sessions.pop(admin_id)
+            await message.reply(f"🔓 Управление группой `{target}` завершено. ИИ снова активен.")
+        else:
+            await message.reply("ℹ️ Нет активного управления.")
+        return
+
+    try:
+        chat_id = int(args[1])
+    except ValueError:
+        await message.reply("❌ ID группы должен быть числом.")
+        return
+
+    group_control_sessions[admin_id] = chat_id
+    await message.reply(
+        f"🔧 Теперь вы управляете группой `{chat_id}`.\n"
+        f"Все ваши сообщения будут отправляться в группу. Сообщения из группы будут пересылаться вам.\n"
+        f"ИИ для этой группы отключён.\n"
+        f"Для выхода: /group_connect stop"
+    )
+
 # === ОБРАБОТЧИК СКАЧИВАНИЯ ПО КОМАНДЕ ===
 @dp.message(Command("dl"))
 async def cmd_download(message: types.Message):
     await update_user_activity(message.from_user.id)
+    if message.chat.type != "private":
+        await save_group_info(message.chat)
     url = message.text.replace('/dl', '').strip()
     if not url:
         await message.reply("Пожалуйста, укажите ссылку после команды. Пример: /dl https://youtu.be/...")
@@ -390,6 +545,15 @@ URL_REGEX = re.compile(r'(https?://[^\s]+)')
 @dp.message(lambda message: message.text and URL_REGEX.search(message.text))
 async def handle_url_message(message: types.Message):
     await update_user_activity(message.from_user.id)
+    if message.chat.type != "private":
+        await save_group_info(message.chat)
+        if not await is_bot_mentioned(message):
+            return
+
+    # Если админ управляет группой, пропускаем (перехватится в основном обработчике)
+    for admin_id, chat_id in group_control_sessions.items():
+        if message.chat.id == chat_id:
+            return
 
     if message.from_user.id in admin_sessions and message.from_user.id in control_sessions:
         return
@@ -417,6 +581,20 @@ async def handle_url_message(message: types.Message):
 async def handle_document(message: types.Message):
     user_id = message.from_user.id
     await update_user_activity(user_id)
+    if message.chat.type != "private":
+        await save_group_info(message.chat)
+        if not await is_bot_mentioned(message):
+            return
+
+    # Управление группами: пересылка админу
+    for admin_id, chat_id in group_control_sessions.items():
+        if message.chat.id == chat_id:
+            sender_name = message.from_user.full_name or "Неизвестный"
+            header = f"👤 **От отправителя:** {sender_name} (`{user_id}`)\n\n"
+            await bot.send_message(admin_id, header + "📎 Получен документ.")
+            await bot.forward_message(admin_id, message.chat.id, message.message_id)
+            await message.reply("📄 Документ передан администратору.")
+            return
 
     for admin_id, target_id in control_sessions.items():
         if user_id == target_id:
@@ -464,6 +642,20 @@ async def handle_document(message: types.Message):
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
     await update_user_activity(user_id)
+    if message.chat.type != "private":
+        await save_group_info(message.chat)
+        if not await is_bot_mentioned(message):
+            return
+
+    # Управление группами: пересылка админу
+    for admin_id, chat_id in group_control_sessions.items():
+        if message.chat.id == chat_id:
+            sender_name = message.from_user.full_name or "Неизвестный"
+            header = f"👤 **От отправителя:** {sender_name} (`{user_id}`)\n\n"
+            await bot.send_message(admin_id, header + "📷 Получено фото.")
+            await bot.forward_message(admin_id, message.chat.id, message.message_id)
+            await message.reply("📷 Фото передано администратору.")
+            return
 
     for admin_id, target_id in control_sessions.items():
         if user_id == target_id:
@@ -494,13 +686,41 @@ async def handle_photo(message: types.Message):
     await save_history(user_id, history)
     await message.reply(reply)
 
-# === ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (ОСНОВНОЙ) ===
+# === ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ===
 @dp.message()
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
     await update_user_activity(user_id)
 
-    # Сообщение от админа, управляющего пользователем
+    # Сохраняем информацию о группе
+    if message.chat.type != "private":
+        await save_group_info(message.chat)
+
+    # --- 1. УПРАВЛЕНИЕ ГРУППАМИ (админ -> группа) ---
+    if user_id in admin_sessions and user_id in group_control_sessions:
+        target_chat_id = group_control_sessions[user_id]
+        try:
+            await bot.send_message(target_chat_id, message.text)
+            await message.reply(f"✅ Сообщение отправлено в группу `{target_chat_id}`.")
+        except Exception as e:
+            await message.reply(f"❌ Не удалось отправить сообщение в группу: {e}")
+        return
+
+    # --- 2. УПРАВЛЕНИЕ ГРУППАМИ (группа -> админ) ---
+    for admin_id, chat_id in group_control_sessions.items():
+        if message.chat.id == chat_id:
+            sender_name = message.from_user.full_name or "Неизвестный"
+            header = f"👤 **От отправителя:** {sender_name} (`{user_id}`)\n\n"
+            await bot.send_message(admin_id, header + message.text)
+            await message.reply("📨 Сообщение передано администратору.")
+            return
+
+    # --- 3. ПРОВЕРКА УПОМИНАНИЯ В ГРУППАХ ---
+    if message.chat.type != "private":
+        if not await is_bot_mentioned(message):
+            return
+
+    # --- 4. УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ (личка) ---
     if user_id in admin_sessions and user_id in control_sessions:
         target_id = control_sessions[user_id]
         try:
@@ -510,15 +730,21 @@ async def handle_text(message: types.Message):
             await message.reply(f"❌ Не удалось отправить сообщение: {e}")
         return
 
-    # Сообщение от управляемого пользователя
     for admin_id, target_id in control_sessions.items():
         if user_id == target_id:
             await bot.send_message(admin_id, f"💬 Сообщение от пользователя `{user_id}`:\n\n{message.text}")
             await message.reply("📨 Ваше сообщение передано администратору. Ожидайте ответа.")
             return
 
-    # Обычное сообщение → ИИ
+    # --- 5. ОБЫЧНЫЙ ОТВЕТ ИИ ---
     user_text = message.text
+    if message.chat.type != "private":
+        bot_username = (await bot.me()).username
+        user_text = clean_text_from_mention(user_text, bot_username)
+        if not user_text:
+            await message.reply("👋 Я слушаю! Напишите ваш вопрос после @упоминания.")
+            return
+
     history = await load_history(user_id)
     history.append({"role": "user", "content": user_text})
 
