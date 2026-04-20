@@ -215,6 +215,18 @@ def clean_text_from_mention(text: str, bot_username: str) -> str:
     pattern = rf"@{re.escape(bot_username)}\s*"
     return re.sub(pattern, "", text).strip()
 
+# === ПРИВЕТСТВИЕ И СОХРАНЕНИЕ ГРУППЫ ПРИ ДОБАВЛЕНИИ ===
+@dp.message(F.new_chat_members)
+async def on_bot_added_to_group(message: types.Message):
+    for member in message.new_chat_members:
+        if member.id == bot.id:
+            await save_group_info(message.chat)
+            bot_username = (await bot.me()).username
+            await message.answer(
+                f"👋 Привет! Я бот с Groq и памятью.\n"
+                f"В группах я отвечаю только если вы упомянете меня (@{bot_username}) или ответите на моё сообщение."
+            )
+
 # === ХЕНДЛЕРЫ КОМАНД ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
