@@ -435,7 +435,7 @@ async def cmd_history_admin(message: types.Message):
     else:
         await message.reply(text)
 
-# === КОМАНДЫ УПРАВЛЕНИЯ ГРУППАМИ (ИСПРАВЛЕННЫЕ, БЕЗ ДЕКОРАТОРА) ===
+# === КОМАНДЫ УПРАВЛЕНИЯ ГРУППАМИ (БЕЗ ДЕКОРАТОРА) ===
 @dp.message(Command("groups"))
 async def cmd_groups(message: types.Message):
     await update_user_activity(message.from_user.id)
@@ -548,7 +548,6 @@ async def handle_url_message(message: types.Message):
             sender_info = f"{user.full_name or 'Без имени'}({tag})"
             await bot.send_message(admin_id, f"{sender_info}\n🔗 Прислана ссылка.")
             await bot.forward_message(admin_id, message.chat.id, message.message_id)
-            await message.reply("📨 Ссылка передана администратору.")
             return
 
     urls = URL_REGEX.findall(message.text)
@@ -587,7 +586,6 @@ async def handle_document(message: types.Message):
             sender_info = f"{user.full_name or 'Без имени'}({tag})"
             await bot.send_message(admin_id, f"{sender_info}\n📎 Получен документ.")
             await bot.forward_message(admin_id, message.chat.id, message.message_id)
-            await message.reply("📄 Документ передан администратору.")
             return
 
     for admin_id, target_id in control_sessions.items():
@@ -649,7 +647,6 @@ async def handle_photo(message: types.Message):
             sender_info = f"{user.full_name or 'Без имени'}({tag})"
             await bot.send_message(admin_id, f"{sender_info}\n📷 Получено фото.")
             await bot.forward_message(admin_id, message.chat.id, message.message_id)
-            await message.reply("📷 Фото передано администратору.")
             return
 
     for admin_id, target_id in control_sessions.items():
@@ -690,14 +687,13 @@ async def handle_text(message: types.Message):
     if message.chat.type != "private":
         await save_group_info(message.chat)
 
-    # 1. ГРУППОВОЕ УПРАВЛЕНИЕ: пересылка админу
+    # 1. ГРУППОВОЕ УПРАВЛЕНИЕ: пересылка админу (без ответа в чат)
     for admin_id, target_chat_id in group_control_sessions.items():
         if message.chat.id == target_chat_id:
             user = message.from_user
             tag = f"@{user.username}" if user.username else str(user.id)
             sender_info = f"{user.full_name or 'Без имени'}({tag})"
             await bot.send_message(admin_id, f"{sender_info}\n{message.text}")
-            await message.reply("📨 Сообщение передано администратору.")
             return
 
     # 2. АДМИН ОТПРАВЛЯЕТ В ГРУППУ
