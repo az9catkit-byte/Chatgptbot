@@ -10,6 +10,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import FSInputFile
 from groq import AsyncGroq
 import PyPDF2
 from docx import Document
@@ -577,7 +578,7 @@ async def cmd_group_connect(message: types.Message):
         f"Для выхода: /group_connect stop"
     )
 
-# === СКАЧИВАНИЕ ВИДЕО (ОБНОВЛЁННЫЙ ОБРАБОТЧИК) ===
+# === СКАЧИВАНИЕ ВИДЕО (ИСПРАВЛЕННАЯ ОТПРАВКА) ===
 @dp.message(Command("dl"))
 async def cmd_download(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
@@ -591,8 +592,8 @@ async def cmd_download(message: types.Message):
 
     if file_path and os.path.exists(file_path):
         try:
-            with open(file_path, 'rb') as video:
-                await bot.send_video(message.chat.id, video)
+            video_file = FSInputFile(file_path)
+            await bot.send_video(message.chat.id, video_file)
         except Exception as e:
             await message.reply(f"❌ Ошибка отправки видео: {e}")
         finally:
@@ -606,7 +607,7 @@ async def cmd_download(message: types.Message):
     else:
         await message.reply("❌ Не удалось скачать видео. Возможно, ссылка недействительна или видео слишком большое.")
 
-# === ССЫЛКИ В ТЕКСТЕ ===
+# === ССЫЛКИ В ТЕКСТЕ (ИСПРАВЛЕННАЯ ОТПРАВКА) ===
 URL_REGEX = re.compile(r'(https?://[^\s]+)')
 
 @dp.message(lambda message: message.text and URL_REGEX.search(message.text))
@@ -636,8 +637,8 @@ async def handle_url_message(message: types.Message):
 
             if file_path and os.path.exists(file_path):
                 try:
-                    with open(file_path, 'rb') as video:
-                        await bot.send_video(message.chat.id, video)
+                    video_file = FSInputFile(file_path)
+                    await bot.send_video(message.chat.id, video_file)
                 except Exception as e:
                     await message.reply(f"❌ Ошибка отправки видео: {e}")
                 finally:
