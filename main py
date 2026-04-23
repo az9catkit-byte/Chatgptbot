@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import glob
 import aiofiles
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -81,13 +82,26 @@ async def get_all_groups() -> dict:
 def get_activity_file_path(user_id: int) -> str:
     return os.path.join(ACTIVITY_DIR, f"{user_id}.json")
 
-async def update_user_activity(user_id: int):
+async def update_user_activity(user_id: int, user: types.User = None):
     file_path = get_activity_file_path(user_id)
     data = {"last_active": time.time()}
+    if user:
+        data["first_name"] = user.first_name
+        data["last_name"] = user.last_name
+        data["username"] = user.username
+    else:
+        if os.path.exists(file_path):
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                try:
+                    old_data = json.loads(await f.read())
+                    data.update({k: v for k, v in old_data.items() if k != "last_active"})
+                except:
+                    pass
     async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
-        await f.write(json.dumps(data))
+        await f.write(json.dumps(data, ensure_ascii=False))
 
 async def get_all_users_activity() -> dict:
+    """Возвращает словарь {user_id: {last_active, first_name, last_name, username}}"""
     result = {}
     for filename in os.listdir(ACTIVITY_DIR):
         if filename.endswith('.json'):
@@ -95,7 +109,7 @@ async def get_all_users_activity() -> dict:
             try:
                 async with aiofiles.open(os.path.join(ACTIVITY_DIR, filename), 'r') as f:
                     data = json.loads(await f.read())
-                    result[user_id] = data.get("last_active", 0)
+                    result[user_id] = data
             except:
                 pass
     return result
@@ -163,27 +177,73 @@ async def process_document(message: types.Message) -> tuple[str, str]:
     os.remove(file_path)
     return file_name, extracted_text.strip()
 
-# === ВИДЕО ===
+# === ВИДЕО (ОБНОВЛЁННАЯ ФУНКЦИЯ) ===
 async def download_video(url: str, user_id: int) -> str | None:
+    """
+    Скачивает видео по ссылке с помощью yt-dlp.
+    Возвращает путь к файлу или строку с типом ошибки.
+    """
     ydl_opts = {
-        'format': 'best[height<=720]',
-        'outtmpl': os.path.join(DOWNLOADS_DIR, f'{user_id}_%(title)s.%(ext)s'),
+        'format': "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
+        'merge_output_format': 'mp4',
         'quiet': True,
         'no_warnings': True,
-        'max_filesize': 50 * 1024 * 1024,
+        'outtmpl': os.path.join(DOWNLOADS_DIR, f'{user_id}_%(title)s.%(ext)s'),
+        'restrictfilenames': True,
     }
+    
+    # Удаляем старые файлы (старше 2 часов)
+    now = time.time()
+    for f in glob.glob(os.path.join(DOWNLOADS_DIR, f"{user_id}_*")):
+        try:
+            if os.path.getmtime(f) < now - 7200:
+                os.remove(f)
+        except:
+            pass
+    for f in glob.glob(os.path.join(DOWNLOADS_DIR, "*.part")):
+        try:
+            if os.path.getmtime(f) < now - 3600:
+                os.remove(f)
+        except:
+            pass
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=False)
+            duration = info.get('duration', 0)
+            if duration and duration > 3600:
+                print(f"Видео длиннее 1 часа ({duration} сек), возможно, оно будет слишком большим.")
+            
+            ydl.download([url])
             filename = ydl.prepare_filename(info)
+            
             base, _ = os.path.splitext(filename)
             for ext in ['.mp4', '.webm', '.mkv']:
                 potential_path = base + ext
                 if os.path.exists(potential_path):
+                    if os.path.getsize(potential_path) > 50 * 1024 * 1024:
+                        os.remove(potential_path)
+                        return "SIZE_LIMIT"
                     return potential_path
+            
+            for f in glob.glob(base + ".*"):
+                if os.path.getsize(f) > 50 * 1024 * 1024:
+                    os.remove(f)
+                    return "SIZE_LIMIT"
+                return f
+            return None
+
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e).lower()
+        if "video unavailable" in error_msg or "private" in error_msg or "removed" in error_msg:
+            return "UNAVAILABLE"
+        elif "geo-restricted" in error_msg or "not available in your country" in error_msg:
+            return "GEO_RESTRICTED"
+        else:
+            print(f"Ошибка скачивания: {e}")
             return None
     except Exception as e:
-        print(f"Ошибка скачивания: {e}")
+        print(f"Неизвестная ошибка при скачивании: {e}")
         return None
 
 # === УПОМИНАНИЕ БОТА ===
@@ -211,7 +271,7 @@ def clean_text_from_mention(text: str, bot_username: str) -> str:
 # === ХЕНДЛЕРЫ КОМАНД ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     await message.answer(
         "👋 Привет! Я бот с Groq и памятью в файлах.\n\n"
         "📝 **Возможности:**\n"
@@ -226,7 +286,7 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     user_id = message.from_user.id
     file_path = get_user_file_path(user_id)
     if os.path.exists(file_path):
@@ -235,7 +295,7 @@ async def cmd_clear(message: types.Message):
 
 @dp.message(Command("history"))
 async def cmd_history(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     user_id = message.from_user.id
     history = await load_history(user_id)
     if not history:
@@ -251,7 +311,7 @@ async def cmd_history(message: types.Message):
 # === АДМИНИСТРАТИВНЫЙ ВХОД (ТОЛЬКО В ЛИЧКЕ) ===
 @dp.message(F.text.lower() == "administratormode")
 async def admin_mode_trigger(message: types.Message, state: FSMContext):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     user_id = message.from_user.id
 
     if message.chat.type != "private":
@@ -272,7 +332,7 @@ async def admin_mode_trigger(message: types.Message, state: FSMContext):
 
 @dp.message(StateFilter(AdminAuth.waiting_for_password))
 async def process_password(message: types.Message, state: FSMContext):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     user_id = message.from_user.id
 
     if message.chat.type != "private":
@@ -300,7 +360,7 @@ async def process_password(message: types.Message, state: FSMContext):
 # === КОМАНДЫ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЕМ ===
 @dp.message(Command("control"))
 async def cmd_control(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     admin_id = message.from_user.id
     if message.chat.type != "private":
         await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
@@ -342,7 +402,7 @@ async def cmd_control(message: types.Message):
 
 @dp.message(Command("online"))
 async def cmd_online(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     if message.chat.type != "private":
         await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
         return
@@ -357,23 +417,35 @@ async def cmd_online(message: types.Message):
 
     now = time.time()
     lines = ["👥 **Статус пользователей:**\n"]
-    for user_id, last_active in sorted(activities.items(), key=lambda x: x[1], reverse=True):
+    for user_id, data in sorted(activities.items(), key=lambda x: x[1].get("last_active", 0), reverse=True):
+        last_active = data.get("last_active", 0)
         delta = now - last_active
         if delta < ONLINE_THRESHOLD:
             status = "🟢 онлайн"
         else:
             status = "🔴 офлайн"
         time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_active))
-        lines.append(f"• Пользователь(`{user_id}`): {status} (посл. {time_str})")
+
+        if "username" in data and data["username"]:
+            display_name = f"@{data['username']} ({user_id})"
+        elif "first_name" in data:
+            name_parts = [data["first_name"]]
+            if data.get("last_name"):
+                name_parts.append(data["last_name"])
+            display_name = f"{' '.join(name_parts)} ({user_id})"
+        else:
+            display_name = f"ID:{user_id}"
+
+        lines.append(f"• {display_name}: {status} (посл. {time_str})")
 
     text = "\n".join(lines[:31])
     if len(lines) > 31:
         text += f"\n... и ещё {len(lines)-31}"
-    await message.reply(text, parse_mode="Markdown")
+    await message.reply(text)
 
 @dp.message(Command("users"))
 async def cmd_users(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     if message.chat.type != "private":
         await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
         return
@@ -398,7 +470,7 @@ async def cmd_users(message: types.Message):
 
 @dp.message(Command("history_admin"))
 async def cmd_history_admin(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     if message.chat.type != "private":
         await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
         return
@@ -435,10 +507,10 @@ async def cmd_history_admin(message: types.Message):
     else:
         await message.reply(text)
 
-# === КОМАНДЫ УПРАВЛЕНИЯ ГРУППАМИ (БЕЗ ДЕКОРАТОРА) ===
+# === КОМАНДЫ УПРАВЛЕНИЯ ГРУППАМИ ===
 @dp.message(Command("groups"))
 async def cmd_groups(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     if message.chat.type != "private":
         await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
         return
@@ -463,7 +535,7 @@ async def cmd_groups(message: types.Message):
 
 @dp.message(Command("group_connect"))
 async def cmd_group_connect(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     admin_id = message.from_user.id
     if message.chat.type != "private":
         await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
@@ -505,10 +577,10 @@ async def cmd_group_connect(message: types.Message):
         f"Для выхода: /group_connect stop"
     )
 
-# === СКАЧИВАНИЕ ВИДЕО ===
+# === СКАЧИВАНИЕ ВИДЕО (ОБНОВЛЁННЫЙ ОБРАБОТЧИК) ===
 @dp.message(Command("dl"))
 async def cmd_download(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
     url = message.text.replace('/dl', '').strip()
     if not url:
         await message.reply("Пожалуйста, укажите ссылку после команды. Пример: /dl https://youtu.be/...")
@@ -525,6 +597,12 @@ async def cmd_download(message: types.Message):
             await message.reply(f"❌ Ошибка отправки видео: {e}")
         finally:
             os.remove(file_path)
+    elif file_path == "UNAVAILABLE":
+        await message.reply("❌ Видео недоступно. Возможно, оно приватное или удалено.")
+    elif file_path == "GEO_RESTRICTED":
+        await message.reply("❌ Это видео недоступно в вашем регионе.")
+    elif file_path == "SIZE_LIMIT":
+        await message.reply(f"❌ Видео слишком большое (более 50 МБ). Telegram не позволяет отправлять такие файлы.")
     else:
         await message.reply("❌ Не удалось скачать видео. Возможно, ссылка недействительна или видео слишком большое.")
 
@@ -533,7 +611,7 @@ URL_REGEX = re.compile(r'(https?://[^\s]+)')
 
 @dp.message(lambda message: message.text and URL_REGEX.search(message.text))
 async def handle_url_message(message: types.Message):
-    await update_user_activity(message.from_user.id)
+    await update_user_activity(message.from_user.id, message.from_user)
 
     if message.chat.type != "private" and not await is_bot_mentioned(message):
         return
@@ -564,6 +642,12 @@ async def handle_url_message(message: types.Message):
                     await message.reply(f"❌ Ошибка отправки видео: {e}")
                 finally:
                     os.remove(file_path)
+            elif file_path == "UNAVAILABLE":
+                await message.reply("❌ Видео недоступно. Возможно, оно приватное или удалено.")
+            elif file_path == "GEO_RESTRICTED":
+                await message.reply("❌ Это видео недоступно в вашем регионе.")
+            elif file_path == "SIZE_LIMIT":
+                await message.reply("❌ Видео слишком большое (более 50 МБ).")
             else:
                 await message.reply("❌ Не удалось скачать видео.")
             break
@@ -572,7 +656,7 @@ async def handle_url_message(message: types.Message):
 @dp.message(lambda message: message.document is not None)
 async def handle_document(message: types.Message):
     user_id = message.from_user.id
-    await update_user_activity(user_id)
+    await update_user_activity(user_id, message.from_user)
 
     if message.chat.type != "private":
         await save_group_info(message.chat)
@@ -633,7 +717,7 @@ async def handle_document(message: types.Message):
 @dp.message(lambda message: message.photo is not None)
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
-    await update_user_activity(user_id)
+    await update_user_activity(user_id, message.from_user)
 
     if message.chat.type != "private":
         await save_group_info(message.chat)
@@ -682,7 +766,7 @@ async def handle_photo(message: types.Message):
 @dp.message()
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
-    await update_user_activity(user_id)
+    await update_user_activity(user_id, message.from_user)
 
     if message.chat.type != "private":
         await save_group_info(message.chat)
