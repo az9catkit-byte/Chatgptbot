@@ -4,6 +4,7 @@ import os
 import re
 import time
 import glob
+import urllib.parse
 import aiofiles
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
@@ -24,15 +25,12 @@ try:
     )
 except ImportError:
     raise ImportError(
-        "Не найден файл config.py или в нём отсутствуют необходимые переменные. "
-        "Убедитесь, что config.py содержит TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY"
+        "Не найден файл config.py. Создайте его с переменными: "
+        "TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY"
     )
 
 if not all([TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY]):
-    raise ValueError(
-        "Все переменные в config.py (TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, "
-        "POLLINATIONS_API_KEY) должны быть заполнены"
-    )
+    raise ValueError("Все переменные в config.py должны быть заполнены")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 storage = MemoryStorage()
@@ -247,16 +245,26 @@ async def download_video(url: str, user_id: int) -> str | None:
         print(f"Неизвестная ошибка при скачивании: {e}")
         return None
 
-# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (POLLINATIONS API + FALLBACK) ===
+# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (ПОЛНОСТЬЮ ПЕРЕПИСАННАЯ) ===
 async def generate_image(prompt: str, user_id: int) -> str | None:
     """
-    Пытается сгенерировать изображение через API, в случае неудачи – через прямую ссылку.
-    Возвращает:
-      - URL (если API вернул ссылку)
-      - путь к локальному файлу (если fallback сработал)
-      - None (если всё плохо)
+    Возвращает URL картинки или путь к локальному файлу.
+    При неудаче возвращает None.
     """
-    # 1. Пробуем через API
+    # 1. Пробуем официальный API
+    api_result = await generate_via_api(prompt)
+    if api_result:
+        return api_result  # это URL
+
+    # 2. Fallback – прямая ссылка (без ключа)
+    fallback_result = await generate_via_fallback(prompt, user_id)
+    if fallback_result:
+        return fallback_result  # путь к файлу
+
+    return None
+
+async def generate_via_api(prompt: str) -> str | None:
+    """Генерация через API Pollinations (требует ключ). Возвращает URL."""
     url = "https://api.pollinations.ai/v1/images/generations"
     headers = {
         "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
@@ -269,35 +277,44 @@ async def generate_image(prompt: str, user_id: int) -> str | None:
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+            async with session.post(url, json=payload, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=45)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if "data" in data and len(data["data"]) > 0:
-                        return data["data"][0]["url"]  # вернёт URL
+                        image_url = data["data"][0]["url"]
+                        print(f"API успешен: {image_url}")
+                        return image_url
+                else:
+                    error_text = await resp.text()
+                    print(f"API error {resp.status}: {error_text[:200]}")
+    except asyncio.TimeoutError:
+        print("API timeout")
     except Exception as e:
-        print(f"Pollinations API error: {e}")
+        print(f"API exception: {e}")
+    return None
 
-    # 2. Если API не сработал – fallback
-    return await generate_image_fallback(prompt, user_id)
+async def generate_via_fallback(prompt: str, user_id: int) -> str | None:
+    """Fallback: загружаем изображение по прямой ссылке, сохраняем локально."""
+    encoded = urllib.parse.quote(prompt)
+    image_url = f"https://pollinations.ai/p/{encoded}?model=flux&width=1024&height=1024&nologo=true"
+    file_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_fallback.png")
 
-async def generate_image_fallback(prompt: str, user_id: int) -> str | None:
-    """Fallback-метод: генерация через прямую ссылку pollinations.ai/p/..."""
-    encoded_prompt = requests.utils.requote(prompt)  # кодируем пробелы и спецсимволы
-    image_url = f"https://pollinations.ai/p/{encoded_prompt}?model=flux&width=1024&height=1024&nologo=true"
-    
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(image_url, timeout=60) as resp:
+            async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status == 200:
                     content = await resp.read()
-                    # Сохраняем во временный файл
-                    file_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_fallback.png")
-                    with open(file_path, "wb") as f:
-                        f.write(content)
+                    async with aiofiles.open(file_path, 'wb') as f:
+                        await f.write(content)
+                    print(f"Fallback сохранён: {file_path}")
                     return file_path
+                else:
+                    print(f"Fallback error: {resp.status}")
+    except asyncio.TimeoutError:
+        print("Fallback timeout")
     except Exception as e:
-        print(f"Fallback generation failed: {e}")
-
+        print(f"Fallback exception: {e}")
     return None
 
 # === УПОМИНАНИЕ БОТА ===
@@ -645,12 +662,13 @@ async def cmd_image(message: types.Message):
                 await bot.send_photo(message.chat.id, result, caption=f"Промпт: {prompt}")
             else:
                 # Локальный файл из fallback
-                await bot.send_photo(message.chat.id, FSInputFile(result), caption=f"Промпт: {prompt}")
+                photo = FSInputFile(result)
+                await bot.send_photo(message.chat.id, photo, caption=f"Промпт: {prompt}")
                 os.remove(result)  # удаляем временный файл
         except Exception as e:
             await message.reply(f"❌ Не удалось отправить изображение: {e}")
     else:
-        await message.reply("❌ Не удалось создать изображение ни через API, ни через резервный метод.")
+        await message.reply("❌ Не удалось создать изображение. Попробуйте позже или измените запрос.")
 
 # === СКАЧИВАНИЕ ВИДЕО ===
 @dp.message(Command("dl"))
