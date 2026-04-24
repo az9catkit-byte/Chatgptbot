@@ -245,26 +245,23 @@ async def download_video(url: str, user_id: int) -> str | None:
         print(f"Неизвестная ошибка при скачивании: {e}")
         return None
 
-# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (ПОЛНОСТЬЮ ПЕРЕПИСАННАЯ) ===
+# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (ИСПРАВЛЕННАЯ) ===
 async def generate_image(prompt: str, user_id: int) -> str | None:
-    """
-    Возвращает URL картинки или путь к локальному файлу.
-    При неудаче возвращает None.
-    """
-    # 1. Пробуем официальный API
+    """Возвращает URL картинки или путь к локальному файлу."""
+    # 1. Пробуем API
     api_result = await generate_via_api(prompt)
     if api_result:
-        return api_result  # это URL
+        return api_result
 
-    # 2. Fallback – прямая ссылка (без ключа)
+    # 2. Fallback – прямая ссылка
     fallback_result = await generate_via_fallback(prompt, user_id)
     if fallback_result:
-        return fallback_result  # путь к файлу
+        return fallback_result
 
     return None
 
 async def generate_via_api(prompt: str) -> str | None:
-    """Генерация через API Pollinations (требует ключ). Возвращает URL."""
+    """Генерация через официальный API (возвращает URL)."""
     url = "https://api.pollinations.ai/v1/images/generations"
     headers = {
         "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
@@ -295,15 +292,20 @@ async def generate_via_api(prompt: str) -> str | None:
     return None
 
 async def generate_via_fallback(prompt: str, user_id: int) -> str | None:
-    """Fallback: загружаем изображение по прямой ссылке, сохраняем локально."""
+    """Fallback: прямая загрузка изображения с image.pollinations.ai."""
     encoded = urllib.parse.quote(prompt)
-    image_url = f"https://pollinations.ai/p/{encoded}?model=flux&width=1024&height=1024&nologo=true"
+    # Правильный прямой URL, возвращающий картинку
+    image_url = f"https://image.pollinations.ai/prompt/{encoded}?model=flux&width=1024&height=1024&nologo=true"
     file_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_fallback.png")
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status == 200:
+                    content_type = resp.headers.get('Content-Type', '')
+                    if 'image' not in content_type:
+                        print(f"Fallback вернул не изображение: {content_type}")
+                        return None
                     content = await resp.read()
                     async with aiofiles.open(file_path, 'wb') as f:
                         await f.write(content)
@@ -661,7 +663,6 @@ async def cmd_image(message: types.Message):
             if result.startswith("http"):
                 await bot.send_photo(message.chat.id, result, caption=f"Промпт: {prompt}")
             else:
-                # Локальный файл из fallback
                 photo = FSInputFile(result)
                 await bot.send_photo(message.chat.id, photo, caption=f"Промпт: {prompt}")
                 os.remove(result)  # удаляем временный файл
