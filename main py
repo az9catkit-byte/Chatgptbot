@@ -247,8 +247,16 @@ async def download_video(url: str, user_id: int) -> str | None:
         print(f"Неизвестная ошибка при скачивании: {e}")
         return None
 
-# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (POLLINATIONS) ===
-async def generate_image(prompt: str) -> str | None:
+# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (POLLINATIONS API + FALLBACK) ===
+async def generate_image(prompt: str, user_id: int) -> str | None:
+    """
+    Пытается сгенерировать изображение через API, в случае неудачи – через прямую ссылку.
+    Возвращает:
+      - URL (если API вернул ссылку)
+      - путь к локальному файлу (если fallback сработал)
+      - None (если всё плохо)
+    """
+    # 1. Пробуем через API
     url = "https://api.pollinations.ai/v1/images/generations"
     headers = {
         "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
@@ -265,16 +273,32 @@ async def generate_image(prompt: str) -> str | None:
                 if resp.status == 200:
                     data = await resp.json()
                     if "data" in data and len(data["data"]) > 0:
-                        return data["data"][0]["url"]
-                    else:
-                        return None
-                else:
-                    error_text = await resp.text()
-                    print(f"Pollinations API error: {resp.status} - {error_text}")
-                    return None
+                        return data["data"][0]["url"]  # вернёт URL
     except Exception as e:
-        print(f"Pollinations request failed: {e}")
-        return None
+        print(f"Pollinations API error: {e}")
+
+    # 2. Если API не сработал – fallback
+    return await generate_image_fallback(prompt, user_id)
+
+async def generate_image_fallback(prompt: str, user_id: int) -> str | None:
+    """Fallback-метод: генерация через прямую ссылку pollinations.ai/p/..."""
+    encoded_prompt = requests.utils.requote(prompt)  # кодируем пробелы и спецсимволы
+    image_url = f"https://pollinations.ai/p/{encoded_prompt}?model=flux&width=1024&height=1024&nologo=true"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url, timeout=60) as resp:
+                if resp.status == 200:
+                    content = await resp.read()
+                    # Сохраняем во временный файл
+                    file_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_fallback.png")
+                    with open(file_path, "wb") as f:
+                        f.write(content)
+                    return file_path
+    except Exception as e:
+        print(f"Fallback generation failed: {e}")
+
+    return None
 
 # === УПОМИНАНИЕ БОТА ===
 async def is_bot_mentioned(message: types.Message) -> bool:
@@ -595,7 +619,7 @@ async def cmd_group_connect(message: types.Message):
         f"Для выхода: /group_connect stop"
     )
 
-# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ===
+# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (КОМАНДА) ===
 @dp.message(Command("image"))
 async def cmd_image(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
@@ -613,15 +637,20 @@ async def cmd_image(message: types.Message):
         return
 
     await message.reply("🎨 Генерирую изображение, подождите немного...")
-    image_url = await generate_image(prompt)
+    result = await generate_image(prompt, message.from_user.id)
 
-    if image_url:
+    if result:
         try:
-            await bot.send_photo(message.chat.id, image_url, caption=f"Промпт: {prompt}")
+            if result.startswith("http"):
+                await bot.send_photo(message.chat.id, result, caption=f"Промпт: {prompt}")
+            else:
+                # Локальный файл из fallback
+                await bot.send_photo(message.chat.id, FSInputFile(result), caption=f"Промпт: {prompt}")
+                os.remove(result)  # удаляем временный файл
         except Exception as e:
             await message.reply(f"❌ Не удалось отправить изображение: {e}")
     else:
-        await message.reply("❌ Не удалось создать изображение. Возможно, сервис недоступен или запрос не прошёл модерацию.")
+        await message.reply("❌ Не удалось создать изображение ни через API, ни через резервный метод.")
 
 # === СКАЧИВАНИЕ ВИДЕО ===
 @dp.message(Command("dl"))
