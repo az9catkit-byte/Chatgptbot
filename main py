@@ -70,64 +70,73 @@ class AdminAuth(StatesGroup):
 
 # === ФУНКЦИИ ДЛЯ ГРУПП ===
 async def save_group_info(chat: types.Chat):
-    groups = {}
-    if os.path.exists(GROUPS_FILE):
-        async with aiofiles.open(GROUPS_FILE, 'r', encoding='utf-8') as f:
-            try:
-                groups = json.loads(await f.read())
-            except:
-                groups = {}
-    groups[str(chat.id)] = {
-        "id": chat.id,
-        "title": chat.title or "Без названия",
-        "type": chat.type,
-        "added_at": time.time()
-    }
-    async with aiofiles.open(GROUPS_FILE, 'w', encoding='utf-8') as f:
-        await f.write(json.dumps(groups, ensure_ascii=False, indent=2))
+    try:
+        groups = {}
+        if os.path.exists(GROUPS_FILE):
+            async with aiofiles.open(GROUPS_FILE, 'r', encoding='utf-8') as f:
+                try:
+                    groups = json.loads(await f.read())
+                except:
+                    groups = {}
+        groups[str(chat.id)] = {
+            "id": chat.id,
+            "title": chat.title or "Без названия",
+            "type": chat.type,
+            "added_at": time.time()
+        }
+        async with aiofiles.open(GROUPS_FILE, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(groups, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(f"Ошибка сохранения группы: {e}")
 
 async def get_all_groups() -> dict:
     if not os.path.exists(GROUPS_FILE):
         return {}
-    async with aiofiles.open(GROUPS_FILE, 'r', encoding='utf-8') as f:
-        try:
+    try:
+        async with aiofiles.open(GROUPS_FILE, 'r', encoding='utf-8') as f:
             return json.loads(await f.read())
-        except:
-            return {}
+    except:
+        return {}
 
 # === АКТИВНОСТЬ ===
 def get_activity_file_path(user_id: int) -> str:
     return os.path.join(ACTIVITY_DIR, f"{user_id}.json")
 
 async def update_user_activity(user_id: int, user: types.User = None):
-    file_path = get_activity_file_path(user_id)
-    data = {"last_active": time.time()}
-    if user:
-        data["first_name"] = user.first_name
-        data["last_name"] = user.last_name
-        data["username"] = user.username
-    else:
-        if os.path.exists(file_path):
-            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-                try:
-                    old_data = json.loads(await f.read())
-                    data.update({k: v for k, v in old_data.items() if k != "last_active"})
-                except:
-                    pass
-    async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
-        await f.write(json.dumps(data, ensure_ascii=False))
+    try:
+        file_path = get_activity_file_path(user_id)
+        data = {"last_active": time.time()}
+        if user:
+            data["first_name"] = user.first_name
+            data["last_name"] = user.last_name
+            data["username"] = user.username
+        else:
+            if os.path.exists(file_path):
+                async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                    try:
+                        old_data = json.loads(await f.read())
+                        data.update({k: v for k, v in old_data.items() if k != "last_active"})
+                    except:
+                        pass
+        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(data, ensure_ascii=False))
+    except Exception as e:
+        print(f"Ошибка обновления активности: {e}")
 
 async def get_all_users_activity() -> dict:
     result = {}
-    for filename in os.listdir(ACTIVITY_DIR):
-        if filename.endswith('.json'):
-            user_id = int(filename.replace('.json', ''))
-            try:
-                async with aiofiles.open(os.path.join(ACTIVITY_DIR, filename), 'r') as f:
-                    data = json.loads(await f.read())
-                    result[user_id] = data
-            except:
-                pass
+    try:
+        for filename in os.listdir(ACTIVITY_DIR):
+            if filename.endswith('.json'):
+                user_id = int(filename.replace('.json', ''))
+                try:
+                    async with aiofiles.open(os.path.join(ACTIVITY_DIR, filename), 'r') as f:
+                        data = json.loads(await f.read())
+                        result[user_id] = data
+                except:
+                    pass
+    except:
+        pass
     return result
 
 # === ИСТОРИЯ ===
@@ -140,15 +149,17 @@ async def load_history(user_id: int) -> list:
         return []
     try:
         async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-            content = await f.read()
-            return json.loads(content)
+            return json.loads(await f.read())
     except:
         return []
 
 async def save_history(user_id: int, history: list):
-    file_path = get_user_file_path(user_id)
-    async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
-        await f.write(json.dumps(history, ensure_ascii=False, indent=2))
+    try:
+        file_path = get_user_file_path(user_id)
+        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(history, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(f"Ошибка сохранения истории: {e}")
 
 # === ФАЙЛЫ ===
 async def download_file(file_id: str, destination: str):
@@ -501,23 +512,17 @@ async def process_password(message: types.Message, state: FSMContext):
         await message.reply("❌ Неверный пароль.")
     await state.clear()
 
-# === ДЕКОРАТОР ДЛЯ АДМИН-КОМАНД ===
-def require_private_and_admin(func):
-    async def wrapper(message: types.Message, *args, **kwargs):
-        await update_user_activity(message.from_user.id, message.from_user)
-        if message.chat.type != "private":
-            await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
-            return
-        if message.from_user.id not in admin_sessions:
-            await message.reply("⛔ У вас нет прав для этой команды.")
-            return
-        return await func(message, *args, **kwargs)
-    return wrapper
-
-# === КОМАНДЫ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЕМ ===
+# === КОМАНДЫ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЕМ (БЕЗ ДЕКОРАТОРА, С ЯВНЫМИ ПРОВЕРКАМИ) ===
 @dp.message(Command("control"))
-@require_private_and_admin
 async def cmd_control(message: types.Message):
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
+        return
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
     admin_id = message.from_user.id
     args = message.text.split()
     if len(args) == 1:
@@ -551,8 +556,15 @@ async def cmd_control(message: types.Message):
     )
 
 @dp.message(Command("online"))
-@require_private_and_admin
 async def cmd_online(message: types.Message):
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
+        return
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
     activities = await get_all_users_activity()
     if not activities:
         await message.reply("📭 Нет данных об активности пользователей.")
@@ -584,23 +596,40 @@ async def cmd_online(message: types.Message):
     await message.reply(text)
 
 @dp.message(Command("users"))
-@require_private_and_admin
 async def cmd_users(message: types.Message):
-    files = os.listdir(DATA_DIR)
-    user_ids = [int(f.replace('.json', '')) for f in files if f.endswith('.json')]
-    if not user_ids:
-        await message.reply("📭 Нет ни одного пользователя с историей.")
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
         return
-    text = "👥 **Пользователи с историей:**\n"
-    for uid in sorted(user_ids)[:30]:
-        text += f"• Пользователь(`{uid}`)\n"
-    if len(user_ids) > 30:
-        text += f"\n... и ещё {len(user_ids) - 30}"
-    await message.reply(text, parse_mode="Markdown")
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
+    try:
+        files = os.listdir(DATA_DIR)
+        user_ids = [int(f.replace('.json', '')) for f in files if f.endswith('.json')]
+        if not user_ids:
+            await message.reply("📭 Нет ни одного пользователя с историей.")
+            return
+        text = "👥 **Пользователи с историей:**\n"
+        for uid in sorted(user_ids)[:30]:
+            text += f"• Пользователь(`{uid}`)\n"
+        if len(user_ids) > 30:
+            text += f"\n... и ещё {len(user_ids) - 30}"
+        await message.reply(text, parse_mode="Markdown")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка при чтении списка пользователей: {e}")
 
 @dp.message(Command("history_admin"))
-@require_private_and_admin
 async def cmd_history_admin(message: types.Message):
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
+        return
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
     args = message.text.split()
     if len(args) != 2:
         await message.reply("Используйте: /history_admin <user_id>")
@@ -630,8 +659,15 @@ async def cmd_history_admin(message: types.Message):
 
 # === КОМАНДЫ УПРАВЛЕНИЯ ГРУППАМИ ===
 @dp.message(Command("groups"))
-@require_private_and_admin
 async def cmd_groups(message: types.Message):
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
+        return
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
     groups = await get_all_groups()
     if not groups:
         await message.reply("📭 Бот пока не добавлен ни в одну группу.")
@@ -647,8 +683,15 @@ async def cmd_groups(message: types.Message):
         await message.reply(text, parse_mode="Markdown")
 
 @dp.message(Command("group_connect"))
-@require_private_and_admin
 async def cmd_group_connect(message: types.Message):
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
+        return
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
     admin_id = message.from_user.id
     args = message.text.split()
     if len(args) == 1:
@@ -683,64 +726,93 @@ async def cmd_group_connect(message: types.Message):
         f"Для выхода: /group_connect stop"
     )
 
-# === ОБЛАЧНЫЕ КОМАНДЫ ===
+# === ОБЛАЧНЫЕ КОМАНДЫ (ТОЛЬКО ДЛЯ АДМИНА) ===
 @dp.message(Command("backup"))
-@require_private_and_admin
 async def cmd_backup(message: types.Message):
-    if not CLOUD_CHANNEL_ID:
-        await message.reply("❌ ID облачного канала не настроен.")
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
         return
-    await message.reply("📦 Создаю резервную копию...")
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+    if not CLOUD_CHANNEL_ID:
+        await message.reply("❌ ID облачного канала не настроен. Добавьте CLOUD_CHANNEL_ID в config.py.")
+        return
+
+    await message.reply("📦 Создаю резервную копию данных...")
     backup_path = await create_backup_zip()
     if not backup_path:
-        await message.reply("❌ Не удалось создать архив.")
+        await message.reply("❌ Не удалось создать архив с данными.")
         return
     if await upload_to_telegram_cloud(backup_path):
-        await message.reply("✅ Данные отправлены в облако.")
+        await message.reply("✅ Данные успешно отправлены в облачное хранилище.")
     else:
-        await message.reply("❌ Ошибка отправки.")
+        await message.reply("❌ Не удалось отправить данные в облако.")
     if os.path.exists(backup_path):
         os.remove(backup_path)
 
 @dp.message(Command("restore"))
-@require_private_and_admin
 async def cmd_restore(message: types.Message):
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
+        return
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
     if not CLOUD_CHANNEL_ID:
         await message.reply("❌ ID облачного канала не настроен.")
         return
-    await message.reply("🔄 Восстанавливаю данные...")
+
+    await message.reply("🔄 Восстанавливаю данные из облака...")
     if await restore_from_telegram_cloud():
-        await message.reply("✅ Данные восстановлены.")
+        await message.reply("✅ Данные успешно восстановлены из облака.")
     else:
-        await message.reply("❌ Не удалось восстановить.")
+        await message.reply("❌ Не удалось восстановить данные из облака.")
 
 @dp.message(Command("sync_data"))
-@require_private_and_admin
 async def cmd_sync_data(message: types.Message):
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
+        return
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
     if not CLOUD_CHANNEL_ID:
         await message.reply("❌ ID облачного канала не настроен.")
         return
-    await message.reply("🔁 Синхронизирую...")
+
+    await message.reply("🔁 Синхронизирую данные с облаком...")
     backup_path = await create_backup_zip()
     if not backup_path:
         await message.reply("❌ Не удалось создать архив.")
         return
     if not await upload_to_telegram_cloud(backup_path):
-        await message.reply("❌ Ошибка отправки.")
+        await message.reply("❌ Не удалось отправить данные.")
         if os.path.exists(backup_path):
             os.remove(backup_path)
         return
     if os.path.exists(backup_path):
         os.remove(backup_path)
-    if await restore_from_telegram_cloud():
-        await message.reply("✅ Синхронизация завершена.")
-    else:
-        await message.reply("❌ Не удалось восстановить.")
 
-# === БЕЗОПАСНАЯ СМЕНА КЛЮЧА GROQ (не трогает config.py) ===
+    if await restore_from_telegram_cloud():
+        await message.reply("✅ Данные синхронизированы с облаком.")
+    else:
+        await message.reply("❌ Не удалось восстановить данные из облака.")
+
+# === БЕЗОПАСНАЯ СМЕНА КЛЮЧА GROQ (НЕ ТРОГАЕТ config.py) ===
 @dp.message(Command("setgroqkey"))
-@require_private_and_admin
 async def cmd_set_groq_key(message: types.Message):
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
+        return
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+
     args = message.text.split()
     if len(args) != 2:
         await message.reply("Используйте: /setgroqkey <новый_ключ>")
@@ -752,7 +824,6 @@ async def cmd_set_groq_key(message: types.Message):
 
     global groq_client, GROQ_API_KEY
     try:
-        # Просто пересоздаём клиент, не трогая файл
         groq_client = AsyncGroq(api_key=new_key)
         GROQ_API_KEY = new_key
         await message.reply("✅ Ключ Groq временно изменён (до перезапуска бота).")
