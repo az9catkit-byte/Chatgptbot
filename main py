@@ -7,6 +7,8 @@ import glob
 import urllib.parse
 import aiofiles
 import aiohttp
+import zipfile
+import shutil
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -21,15 +23,16 @@ import yt_dlp
 # === НАСТРОЙКИ (ИМПОРТ ИЗ config.py) ===
 try:
     from config import (
-        TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY
+        TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD,
+        POLLINATIONS_API_KEY, CLOUD_CHANNEL_ID
     )
 except ImportError:
     raise ImportError(
-        "Не найден файл config.py. Создайте его с переменными: "
-        "TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY"
+        "Не найден файл config.py. Создайте его с переменными:\n"
+        "TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY, CLOUD_CHANNEL_ID"
     )
 
-if not all([TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY]):
+if not all([TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY, CLOUD_CHANNEL_ID]):
     raise ValueError("Все переменные в config.py должны быть заполнены")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -38,10 +41,11 @@ dp = Dispatcher(storage=storage)
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # Папки
-DATA_DIR = "user_data"
-DOWNLOADS_DIR = "downloads"
-ACTIVITY_DIR = "user_activity"
-GROUPS_FILE = "groups.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "user_data")
+DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
+ACTIVITY_DIR = os.path.join(BASE_DIR, "user_activity")
+GROUPS_FILE = os.path.join(BASE_DIR, "groups.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(ACTIVITY_DIR, exist_ok=True)
@@ -245,23 +249,17 @@ async def download_video(url: str, user_id: int) -> str | None:
         print(f"Неизвестная ошибка при скачивании: {e}")
         return None
 
-# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (ИСПРАВЛЕННАЯ) ===
+# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ===
 async def generate_image(prompt: str, user_id: int) -> str | None:
-    """Возвращает URL картинки или путь к локальному файлу."""
-    # 1. Пробуем API
     api_result = await generate_via_api(prompt)
     if api_result:
         return api_result
-
-    # 2. Fallback – прямая ссылка
     fallback_result = await generate_via_fallback(prompt, user_id)
     if fallback_result:
         return fallback_result
-
     return None
 
 async def generate_via_api(prompt: str) -> str | None:
-    """Генерация через официальный API (возвращает URL)."""
     url = "https://api.pollinations.ai/v1/images/generations"
     headers = {
         "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
@@ -279,44 +277,28 @@ async def generate_via_api(prompt: str) -> str | None:
                 if resp.status == 200:
                     data = await resp.json()
                     if "data" in data and len(data["data"]) > 0:
-                        image_url = data["data"][0]["url"]
-                        print(f"API успешен: {image_url}")
-                        return image_url
-                else:
-                    error_text = await resp.text()
-                    print(f"API error {resp.status}: {error_text[:200]}")
-    except asyncio.TimeoutError:
-        print("API timeout")
-    except Exception as e:
-        print(f"API exception: {e}")
+                        return data["data"][0]["url"]
+    except:
+        pass
     return None
 
 async def generate_via_fallback(prompt: str, user_id: int) -> str | None:
-    """Fallback: прямая загрузка изображения с image.pollinations.ai."""
     encoded = urllib.parse.quote(prompt)
-    # Правильный прямой URL, возвращающий картинку
     image_url = f"https://image.pollinations.ai/prompt/{encoded}?model=flux&width=1024&height=1024&nologo=true"
     file_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_fallback.png")
-
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status == 200:
                     content_type = resp.headers.get('Content-Type', '')
                     if 'image' not in content_type:
-                        print(f"Fallback вернул не изображение: {content_type}")
                         return None
                     content = await resp.read()
                     async with aiofiles.open(file_path, 'wb') as f:
                         await f.write(content)
-                    print(f"Fallback сохранён: {file_path}")
                     return file_path
-                else:
-                    print(f"Fallback error: {resp.status}")
-    except asyncio.TimeoutError:
-        print("Fallback timeout")
-    except Exception as e:
-        print(f"Fallback exception: {e}")
+    except:
+        pass
     return None
 
 # === УПОМИНАНИЕ БОТА ===
@@ -341,12 +323,99 @@ def clean_text_from_mention(text: str, bot_username: str) -> str:
     pattern = rf"@{re.escape(bot_username)}\s*"
     return re.sub(pattern, "", text).strip()
 
+# === ОБЛАЧНОЕ СОХРАНЕНИЕ ===
+BACKUP_FILENAME = "bot_data_backup.zip"
+
+async def create_backup_zip() -> str | None:
+    """Создаёт ZIP-архив со всеми данными бота."""
+    try:
+        backup_path = os.path.join(DOWNLOADS_DIR, BACKUP_FILENAME)
+        with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # История диалогов
+            for root, _, files in os.walk(DATA_DIR):
+                for file in files:
+                    if file.endswith('.json'):
+                        full_path = os.path.join(root, file)
+                        arcname = os.path.relpath(full_path, BASE_DIR)
+                        zipf.write(full_path, arcname)
+            # Активность
+            for root, _, files in os.walk(ACTIVITY_DIR):
+                for file in files:
+                    if file.endswith('.json'):
+                        full_path = os.path.join(root, file)
+                        arcname = os.path.relpath(full_path, BASE_DIR)
+                        zipf.write(full_path, arcname)
+            # groups.json
+            if os.path.exists(GROUPS_FILE):
+                zipf.write(GROUPS_FILE, os.path.basename(GROUPS_FILE))
+            # config.py (чтобы сохранить токены)
+            config_path = os.path.join(BASE_DIR, "config.py")
+            if os.path.exists(config_path):
+                zipf.write(config_path, "config.py")
+        return backup_path
+    except Exception as e:
+        print(f"Ошибка создания бэкапа: {e}")
+        return None
+
+async def upload_to_telegram_cloud(file_path: str) -> bool:
+    """Отправляет архив в приватный канал."""
+    try:
+        await bot.send_document(
+            int(CLOUD_CHANNEL_ID),
+            FSInputFile(file_path, filename=BACKUP_FILENAME)
+        )
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки в облако: {e}")
+        return False
+
+async def restore_from_telegram_cloud() -> bool:
+    """Скачивает последний бэкап из канала и восстанавливает данные."""
+    try:
+        # Получаем последние сообщения из канала
+        updates = await bot.get_updates(offset=-10, limit=10, timeout=5)
+        target_message = None
+        for update in reversed(updates):
+            msg = update.message
+            if msg and msg.document and msg.chat.id == int(CLOUD_CHANNEL_ID):
+                target_message = msg
+                break
+
+        if not target_message:
+            print("Бэкап в канале не найден.")
+            return False
+
+        file_id = target_message.document.file_id
+        file = await bot.get_file(file_id)
+        downloaded_path = os.path.join(DOWNLOADS_DIR, "restored_backup.zip")
+        await bot.download_file(file.file_path, downloaded_path)
+
+        # Распаковываем
+        with zipfile.ZipFile(downloaded_path, 'r') as zipf:
+            zipf.extractall(BASE_DIR)
+
+        os.remove(downloaded_path)
+        print("Данные успешно восстановлены из облака.")
+        return True
+    except Exception as e:
+        print(f"Ошибка восстановления: {e}")
+        return False
+
+async def restore_on_startup():
+    """Автоматическое восстановление данных при старте."""
+    if not any(os.listdir(DATA_DIR)) and not os.path.exists(GROUPS_FILE):
+        print("Локальные данные отсутствуют. Пробуем восстановить из облака...")
+        if await restore_from_telegram_cloud():
+            print("Восстановление прошло успешно.")
+        else:
+            print("Не удалось восстановить данные из облака. Начинаем с чистого листа.")
+
 # === ХЕНДЛЕРЫ КОМАНД ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
     await message.answer(
-        "👋 Привет! Я бот с Groq и памятью в файлах.\n\n"
+        "👋 Привет! Я бот с Groq и памятью.\n\n"
         "📝 **Возможности:**\n"
         "— Отвечаю на текстовые сообщения с учётом истории.\n"
         "— Принимаю документы (TXT, PDF, DOCX) и анализирую их содержимое.\n"
@@ -423,35 +492,46 @@ async def process_password(message: types.Message, state: FSMContext):
             "/online — онлайн-статус пользователей\n"
             "/groups — список групп\n"
             "/group_connect <айди> — управлять группой\n"
-            "/group_connect stop — завершить управление группой"
+            "/group_connect stop — завершить управление группой\n"
+            "/setgroqkey <ключ> — сменить ключ Groq\n"
+            "/backup — создать и отправить бекап в облако\n"
+            "/restore — восстановить данные из облака\n"
+            "/sync_data — полная синхронизация с облаком"
         )
     else:
         await message.reply("❌ Неверный пароль.")
     await state.clear()
 
+# === ДЕКОРАТОР ДЛЯ АДМИН-КОМАНД ===
+def require_private_and_admin(func):
+    async def wrapper(message: types.Message, *args, **kwargs):
+        await update_user_activity(message.from_user.id, message.from_user)
+        if message.chat.type != "private":
+            await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
+            return
+        if message.from_user.id not in admin_sessions:
+            await message.reply("⛔ У вас нет прав для этой команды.")
+            return
+        return await func(message, *args, **kwargs)
+    return wrapper
+
 # === КОМАНДЫ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЕМ ===
 @dp.message(Command("control"))
+@require_private_and_admin
 async def cmd_control(message: types.Message):
-    await update_user_activity(message.from_user.id, message.from_user)
-    if message.chat.type != "private":
-        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
-        return
-    if message.from_user.id not in admin_sessions:
-        await message.reply("⛔ У вас нет прав для этой команды.")
-        return
-
+    admin_id = message.from_user.id
     args = message.text.split()
     if len(args) == 1:
-        if message.from_user.id in control_sessions:
-            target = control_sessions[message.from_user.id]
+        if admin_id in control_sessions:
+            target = control_sessions[admin_id]
             await message.reply(f"🔧 Вы управляете пользователем `{target}`. Для выхода: /control stop")
         else:
             await message.reply("ℹ️ Вы не управляете ни одним пользователем. Используйте /control <user_id>.")
         return
 
     if args[1].lower() == "stop":
-        if message.from_user.id in control_sessions:
-            target = control_sessions.pop(message.from_user.id)
+        if admin_id in control_sessions:
+            target = control_sessions.pop(admin_id)
             await message.reply(f"🔓 Управление пользователем `{target}` завершено. ИИ снова активен.")
         else:
             await message.reply("ℹ️ Нет активного управления.")
@@ -463,7 +543,7 @@ async def cmd_control(message: types.Message):
         await message.reply("❌ ID пользователя должен быть числом.")
         return
 
-    control_sessions[message.from_user.id] = target_id
+    control_sessions[admin_id] = target_id
     await message.reply(
         f"🔧 Теперь вы управляете пользователем `{target_id}`.\n"
         f"Все его сообщения будут пересылаться вам. Ваши сообщения будут отправляться ему.\n"
@@ -472,15 +552,8 @@ async def cmd_control(message: types.Message):
     )
 
 @dp.message(Command("online"))
+@require_private_and_admin
 async def cmd_online(message: types.Message):
-    await update_user_activity(message.from_user.id, message.from_user)
-    if message.chat.type != "private":
-        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
-        return
-    if message.from_user.id not in admin_sessions:
-        await message.reply("⛔ У вас нет прав для этой команды.")
-        return
-
     activities = await get_all_users_activity()
     if not activities:
         await message.reply("📭 Нет данных об активности пользователей.")
@@ -512,15 +585,8 @@ async def cmd_online(message: types.Message):
     await message.reply(text)
 
 @dp.message(Command("users"))
+@require_private_and_admin
 async def cmd_users(message: types.Message):
-    await update_user_activity(message.from_user.id, message.from_user)
-    if message.chat.type != "private":
-        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
-        return
-    if message.from_user.id not in admin_sessions:
-        await message.reply("⛔ У вас нет прав для этой команды.")
-        return
-
     files = os.listdir(DATA_DIR)
     user_ids = [int(f.replace('.json', '')) for f in files if f.endswith('.json')]
     if not user_ids:
@@ -534,15 +600,8 @@ async def cmd_users(message: types.Message):
     await message.reply(text, parse_mode="Markdown")
 
 @dp.message(Command("history_admin"))
+@require_private_and_admin
 async def cmd_history_admin(message: types.Message):
-    await update_user_activity(message.from_user.id, message.from_user)
-    if message.chat.type != "private":
-        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
-        return
-    if message.from_user.id not in admin_sessions:
-        await message.reply("⛔ У вас нет прав для этой команды.")
-        return
-
     args = message.text.split()
     if len(args) != 2:
         await message.reply("Используйте: /history_admin <user_id>")
@@ -572,15 +631,8 @@ async def cmd_history_admin(message: types.Message):
 
 # === КОМАНДЫ УПРАВЛЕНИЯ ГРУППАМИ ===
 @dp.message(Command("groups"))
+@require_private_and_admin
 async def cmd_groups(message: types.Message):
-    await update_user_activity(message.from_user.id, message.from_user)
-    if message.chat.type != "private":
-        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
-        return
-    if message.from_user.id not in admin_sessions:
-        await message.reply("⛔ У вас нет прав для этой команды.")
-        return
-
     groups = await get_all_groups()
     if not groups:
         await message.reply("📭 Бот пока не добавлен ни в одну группу.")
@@ -596,27 +648,21 @@ async def cmd_groups(message: types.Message):
         await message.reply(text, parse_mode="Markdown")
 
 @dp.message(Command("group_connect"))
+@require_private_and_admin
 async def cmd_group_connect(message: types.Message):
-    await update_user_activity(message.from_user.id, message.from_user)
-    if message.chat.type != "private":
-        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
-        return
-    if message.from_user.id not in admin_sessions:
-        await message.reply("⛔ У вас нет прав для этой команды.")
-        return
-
+    admin_id = message.from_user.id
     args = message.text.split()
     if len(args) == 1:
-        if message.from_user.id in group_control_sessions:
-            target = group_control_sessions[message.from_user.id]
+        if admin_id in group_control_sessions:
+            target = group_control_sessions[admin_id]
             await message.reply(f"🔧 Вы управляете группой `{target}`. Для выхода: /group_connect stop")
         else:
             await message.reply("ℹ️ Вы не управляете ни одной группой. Используйте /group_connect <айди>.")
         return
 
     if args[1].lower() == "stop":
-        if message.from_user.id in group_control_sessions:
-            target = group_control_sessions.pop(message.from_user.id)
+        if admin_id in group_control_sessions:
+            target = group_control_sessions.pop(admin_id)
             await message.reply(f"🔓 Управление группой `{target}` завершено. ИИ снова активен.")
         else:
             await message.reply("ℹ️ Нет активного управления.")
@@ -628,7 +674,7 @@ async def cmd_group_connect(message: types.Message):
         await message.reply("❌ Айди группы должен быть числом (для супергрупп — отрицательным).")
         return
 
-    group_control_sessions[message.from_user.id] = chat_id
+    group_control_sessions[admin_id] = chat_id
     await message.reply(
         f"🔧 Теперь вы управляете группой `{chat_id}`.\n"
         f"Все сообщения из группы будут пересылаться вам в формате:\n"
@@ -638,7 +684,98 @@ async def cmd_group_connect(message: types.Message):
         f"Для выхода: /group_connect stop"
     )
 
-# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (КОМАНДА) ===
+# === ОБЛАЧНЫЕ КОМАНДЫ (ТОЛЬКО ДЛЯ АДМИНА) ===
+@dp.message(Command("backup"))
+@require_private_and_admin
+async def cmd_backup(message: types.Message):
+    await message.reply("📦 Создаю резервную копию данных...")
+    backup_path = await create_backup_zip()
+    if not backup_path:
+        await message.reply("❌ Не удалось создать архив с данными.")
+        return
+    success = await upload_to_telegram_cloud(backup_path)
+    if success:
+        await message.reply("✅ Данные успешно отправлены в облачное хранилище.")
+    else:
+        await message.reply("❌ Не удалось отправить данные в облако.")
+    if os.path.exists(backup_path):
+        os.remove(backup_path)
+
+@dp.message(Command("restore"))
+@require_private_and_admin
+async def cmd_restore(message: types.Message):
+    await message.reply("🔄 Восстанавливаю данные из облака...")
+    if await restore_from_telegram_cloud():
+        await message.reply("✅ Данные успешно восстановлены из облака.")
+    else:
+        await message.reply("❌ Не удалось восстановить данные из облака.")
+
+@dp.message(Command("sync_data"))
+@require_private_and_admin
+async def cmd_sync_data(message: types.Message):
+    await message.reply("🔁 Синхронизирую данные с облаком...")
+    backup_path = await create_backup_zip()
+    if not backup_path:
+        await message.reply("❌ Не удалось создать архив.")
+        return
+    if not await upload_to_telegram_cloud(backup_path):
+        await message.reply("❌ Не удалось отправить данные.")
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        return
+    if os.path.exists(backup_path):
+        os.remove(backup_path)
+
+    if await restore_from_telegram_cloud():
+        await message.reply("✅ Данные синхронизированы с облаком.")
+    else:
+        await message.reply("❌ Не удалось восстановить данные из облака.")
+
+# === СМЕНА КЛЮЧА GROQ ===
+def update_config_value(key: str, new_value: str) -> bool:
+    try:
+        import config
+        with open(config.__file__, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        with open(config.__file__, 'w', encoding='utf-8') as f:
+            for line in lines:
+                if line.strip().startswith(key):
+                    f.write(f'{key} = "{new_value}"\n')
+                else:
+                    f.write(line)
+        import importlib
+        importlib.reload(config)
+        return True
+    except Exception as e:
+        print(f"Ошибка обновления конфига: {e}")
+        return False
+
+async def update_groq_client(new_key: str):
+    global groq_client, GROQ_API_KEY
+    if update_config_value("GROQ_API_KEY", new_key):
+        GROQ_API_KEY = new_key
+        groq_client = AsyncGroq(api_key=new_key)
+        return True
+    return False
+
+@dp.message(Command("setgroqkey"))
+@require_private_and_admin
+async def cmd_set_groq_key(message: types.Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await message.reply("Используйте: /setgroqkey <новый_ключ>")
+        return
+    new_key = args[1]
+    if not new_key.startswith("gsk_"):
+        await message.reply("❌ Ключ Groq должен начинаться с 'gsk_'")
+        return
+    success = await update_groq_client(new_key)
+    if success:
+        await message.reply("✅ Ключ Groq обновлён. Бот использует новый ключ.")
+    else:
+        await message.reply("❌ Не удалось обновить ключ. Проверьте логи.")
+
+# === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ===
 @dp.message(Command("image"))
 async def cmd_image(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
@@ -665,7 +802,8 @@ async def cmd_image(message: types.Message):
             else:
                 photo = FSInputFile(result)
                 await bot.send_photo(message.chat.id, photo, caption=f"Промпт: {prompt}")
-                os.remove(result)  # удаляем временный файл
+                if os.path.exists(result):
+                    os.remove(result)
         except Exception as e:
             await message.reply(f"❌ Не удалось отправить изображение: {e}")
     else:
@@ -690,7 +828,8 @@ async def cmd_download(message: types.Message):
         except Exception as e:
             await message.reply(f"❌ Ошибка отправки видео: {e}")
         finally:
-            os.remove(file_path)
+            if os.path.exists(file_path):
+                os.remove(file_path)
     elif file_path == "UNAVAILABLE":
         await message.reply("❌ Видео недоступно. Возможно, оно приватное или удалено.")
     elif file_path == "GEO_RESTRICTED":
@@ -735,7 +874,8 @@ async def handle_url_message(message: types.Message):
                 except Exception as e:
                     await message.reply(f"❌ Ошибка отправки видео: {e}")
                 finally:
-                    os.remove(file_path)
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
             elif file_path == "UNAVAILABLE":
                 await message.reply("❌ Видео недоступно. Возможно, оно приватное или удалено.")
             elif file_path == "GEO_RESTRICTED":
@@ -939,6 +1079,7 @@ async def handle_text(message: types.Message):
 
 # === ЗАПУСК ===
 async def main():
+    await restore_on_startup()  # Автоматическое восстановление при старте
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
