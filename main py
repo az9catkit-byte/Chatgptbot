@@ -30,7 +30,7 @@ except ImportError:
         "TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY"
     )
 
-# CLOUD_CHANNEL_ID – опциональный параметр
+# CLOUD_CHANNEL_ID – опциональный параметр (если не указан, облачные функции просто не работают)
 CLOUD_CHANNEL_ID = None
 try:
     from config import CLOUD_CHANNEL_ID
@@ -334,23 +334,28 @@ def clean_text_from_mention(text: str, bot_username: str) -> str:
 BACKUP_FILENAME = "bot_data_backup.zip"
 
 async def create_backup_zip() -> str | None:
+    """Создаёт ZIP-архив со всеми данными бота."""
     try:
         backup_path = os.path.join(DOWNLOADS_DIR, BACKUP_FILENAME)
         with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # История диалогов
             for root, _, files in os.walk(DATA_DIR):
                 for file in files:
                     if file.endswith('.json'):
                         full_path = os.path.join(root, file)
                         arcname = os.path.relpath(full_path, BASE_DIR)
                         zipf.write(full_path, arcname)
+            # Активность
             for root, _, files in os.walk(ACTIVITY_DIR):
                 for file in files:
                     if file.endswith('.json'):
                         full_path = os.path.join(root, file)
                         arcname = os.path.relpath(full_path, BASE_DIR)
                         zipf.write(full_path, arcname)
+            # groups.json
             if os.path.exists(GROUPS_FILE):
                 zipf.write(GROUPS_FILE, os.path.basename(GROUPS_FILE))
+            # config.py (все токены)
             config_path = os.path.join(BASE_DIR, "config.py")
             if os.path.exists(config_path):
                 zipf.write(config_path, "config.py")
@@ -360,6 +365,7 @@ async def create_backup_zip() -> str | None:
         return None
 
 async def upload_to_telegram_cloud(file_path: str) -> bool:
+    """Отправляет архив в приватный канал."""
     if not CLOUD_CHANNEL_ID:
         return False
     try:
@@ -373,9 +379,11 @@ async def upload_to_telegram_cloud(file_path: str) -> bool:
         return False
 
 async def restore_from_telegram_cloud() -> bool:
+    """Скачивает последний бэкап из канала и восстанавливает данные."""
     if not CLOUD_CHANNEL_ID:
         return False
     try:
+        # Ищем последний документ в канале
         updates = await bot.get_updates(offset=-10, limit=10, timeout=5)
         target_message = None
         for update in reversed(updates):
@@ -385,11 +393,13 @@ async def restore_from_telegram_cloud() -> bool:
                 break
         if not target_message:
             return False
+
         file_id = target_message.document.file_id
         file = await bot.get_file(file_id)
         downloaded_path = os.path.join(DOWNLOADS_DIR, "restored_backup.zip")
         await bot.download_file(file.file_path, downloaded_path)
 
+        # Распаковываем
         with zipfile.ZipFile(downloaded_path, 'r') as zipf:
             zipf.extractall(BASE_DIR)
         os.remove(downloaded_path)
@@ -399,13 +409,14 @@ async def restore_from_telegram_cloud() -> bool:
         return False
 
 async def restore_on_startup():
+    """Автоматическое восстановление при запуске, если локальные данные отсутствуют."""
     if not any(os.listdir(DATA_DIR)) and not os.path.exists(GROUPS_FILE):
         if CLOUD_CHANNEL_ID:
             print("Локальные данные отсутствуют. Пробуем восстановить из облака...")
             if await restore_from_telegram_cloud():
                 print("Восстановление прошло успешно.")
             else:
-                print("Не удалось восстановить.")
+                print("Не удалось восстановить данные.")
         else:
             print("Облачное хранилище не настроено. Пропускаем восстановление.")
 
@@ -1087,7 +1098,7 @@ async def handle_text(message: types.Message):
 
 # === ЗАПУСК ===
 async def main():
-    await restore_on_startup()  # Автоматическое восстановление при старте
+    await restore_on_startup()  # Автоматическое восстановление при старте (если настроено)
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
