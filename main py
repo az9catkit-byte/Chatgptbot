@@ -30,7 +30,7 @@ except ImportError:
         "TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY"
     )
 
-# CLOUD_CHANNEL_ID – опциональный параметр (если не указан, облачные функции просто не работают)
+# CLOUD_CHANNEL_ID – опциональный параметр
 CLOUD_CHANNEL_ID = None
 try:
     from config import CLOUD_CHANNEL_ID
@@ -330,32 +330,27 @@ def clean_text_from_mention(text: str, bot_username: str) -> str:
     pattern = rf"@{re.escape(bot_username)}\s*"
     return re.sub(pattern, "", text).strip()
 
-# === ОБЛАЧНОЕ СОХРАНЕНИЕ (ОПЦИОНАЛЬНО) ===
+# === ОБЛАЧНОЕ СОХРАНЕНИЕ ===
 BACKUP_FILENAME = "bot_data_backup.zip"
 
 async def create_backup_zip() -> str | None:
-    """Создаёт ZIP-архив со всеми данными бота."""
     try:
         backup_path = os.path.join(DOWNLOADS_DIR, BACKUP_FILENAME)
         with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # История диалогов
             for root, _, files in os.walk(DATA_DIR):
                 for file in files:
                     if file.endswith('.json'):
                         full_path = os.path.join(root, file)
                         arcname = os.path.relpath(full_path, BASE_DIR)
                         zipf.write(full_path, arcname)
-            # Активность
             for root, _, files in os.walk(ACTIVITY_DIR):
                 for file in files:
                     if file.endswith('.json'):
                         full_path = os.path.join(root, file)
                         arcname = os.path.relpath(full_path, BASE_DIR)
                         zipf.write(full_path, arcname)
-            # groups.json
             if os.path.exists(GROUPS_FILE):
                 zipf.write(GROUPS_FILE, os.path.basename(GROUPS_FILE))
-            # config.py (все токены)
             config_path = os.path.join(BASE_DIR, "config.py")
             if os.path.exists(config_path):
                 zipf.write(config_path, "config.py")
@@ -365,7 +360,6 @@ async def create_backup_zip() -> str | None:
         return None
 
 async def upload_to_telegram_cloud(file_path: str) -> bool:
-    """Отправляет архив в приватный канал."""
     if not CLOUD_CHANNEL_ID:
         return False
     try:
@@ -379,11 +373,9 @@ async def upload_to_telegram_cloud(file_path: str) -> bool:
         return False
 
 async def restore_from_telegram_cloud() -> bool:
-    """Скачивает последний бэкап из канала и восстанавливает данные."""
     if not CLOUD_CHANNEL_ID:
         return False
     try:
-        # Ищем последний документ в канале
         updates = await bot.get_updates(offset=-10, limit=10, timeout=5)
         target_message = None
         for update in reversed(updates):
@@ -393,13 +385,11 @@ async def restore_from_telegram_cloud() -> bool:
                 break
         if not target_message:
             return False
-
         file_id = target_message.document.file_id
         file = await bot.get_file(file_id)
         downloaded_path = os.path.join(DOWNLOADS_DIR, "restored_backup.zip")
         await bot.download_file(file.file_path, downloaded_path)
 
-        # Распаковываем
         with zipfile.ZipFile(downloaded_path, 'r') as zipf:
             zipf.extractall(BASE_DIR)
         os.remove(downloaded_path)
@@ -409,14 +399,13 @@ async def restore_from_telegram_cloud() -> bool:
         return False
 
 async def restore_on_startup():
-    """Автоматическое восстановление при запуске, если локальные данные отсутствуют."""
     if not any(os.listdir(DATA_DIR)) and not os.path.exists(GROUPS_FILE):
         if CLOUD_CHANNEL_ID:
             print("Локальные данные отсутствуют. Пробуем восстановить из облака...")
             if await restore_from_telegram_cloud():
                 print("Восстановление прошло успешно.")
             else:
-                print("Не удалось восстановить данные.")
+                print("Не удалось восстановить.")
         else:
             print("Облачное хранилище не настроено. Пропускаем восстановление.")
 
@@ -503,7 +492,7 @@ async def process_password(message: types.Message, state: FSMContext):
             "/groups — список групп\n"
             "/group_connect <айди> — управлять группой\n"
             "/group_connect stop — завершить управление группой\n"
-            "/setgroqkey <ключ> — сменить ключ Groq\n"
+            "/setgroqkey <ключ> — временно сменить ключ Groq (на одну сессию)\n"
             "/backup — создать и отправить бекап в облако\n"
             "/restore — восстановить данные из облака\n"
             "/sync_data — полная синхронизация с облаком"
@@ -694,23 +683,22 @@ async def cmd_group_connect(message: types.Message):
         f"Для выхода: /group_connect stop"
     )
 
-# === ОБЛАЧНЫЕ КОМАНДЫ (ТОЛЬКО ДЛЯ АДМИНА) ===
+# === ОБЛАЧНЫЕ КОМАНДЫ ===
 @dp.message(Command("backup"))
 @require_private_and_admin
 async def cmd_backup(message: types.Message):
     if not CLOUD_CHANNEL_ID:
-        await message.reply("❌ ID облачного канала не настроен. Добавьте CLOUD_CHANNEL_ID в config.py.")
+        await message.reply("❌ ID облачного канала не настроен.")
         return
-    await message.reply("📦 Создаю резервную копию данных...")
+    await message.reply("📦 Создаю резервную копию...")
     backup_path = await create_backup_zip()
     if not backup_path:
-        await message.reply("❌ Не удалось создать архив с данными.")
+        await message.reply("❌ Не удалось создать архив.")
         return
-    success = await upload_to_telegram_cloud(backup_path)
-    if success:
-        await message.reply("✅ Данные успешно отправлены в облачное хранилище.")
+    if await upload_to_telegram_cloud(backup_path):
+        await message.reply("✅ Данные отправлены в облако.")
     else:
-        await message.reply("❌ Не удалось отправить данные в облако.")
+        await message.reply("❌ Ошибка отправки.")
     if os.path.exists(backup_path):
         os.remove(backup_path)
 
@@ -720,11 +708,11 @@ async def cmd_restore(message: types.Message):
     if not CLOUD_CHANNEL_ID:
         await message.reply("❌ ID облачного канала не настроен.")
         return
-    await message.reply("🔄 Восстанавливаю данные из облака...")
+    await message.reply("🔄 Восстанавливаю данные...")
     if await restore_from_telegram_cloud():
-        await message.reply("✅ Данные успешно восстановлены из облака.")
+        await message.reply("✅ Данные восстановлены.")
     else:
-        await message.reply("❌ Не удалось восстановить данные из облака.")
+        await message.reply("❌ Не удалось восстановить.")
 
 @dp.message(Command("sync_data"))
 @require_private_and_admin
@@ -732,51 +720,24 @@ async def cmd_sync_data(message: types.Message):
     if not CLOUD_CHANNEL_ID:
         await message.reply("❌ ID облачного канала не настроен.")
         return
-    await message.reply("🔁 Синхронизирую данные с облаком...")
+    await message.reply("🔁 Синхронизирую...")
     backup_path = await create_backup_zip()
     if not backup_path:
         await message.reply("❌ Не удалось создать архив.")
         return
     if not await upload_to_telegram_cloud(backup_path):
-        await message.reply("❌ Не удалось отправить данные.")
+        await message.reply("❌ Ошибка отправки.")
         if os.path.exists(backup_path):
             os.remove(backup_path)
         return
     if os.path.exists(backup_path):
         os.remove(backup_path)
-
     if await restore_from_telegram_cloud():
-        await message.reply("✅ Данные синхронизированы с облаком.")
+        await message.reply("✅ Синхронизация завершена.")
     else:
-        await message.reply("❌ Не удалось восстановить данные из облака.")
+        await message.reply("❌ Не удалось восстановить.")
 
-# === СМЕНА КЛЮЧА GROQ ===
-def update_config_value(key: str, new_value: str) -> bool:
-    try:
-        import config
-        with open(config.__file__, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        with open(config.__file__, 'w', encoding='utf-8') as f:
-            for line in lines:
-                if line.strip().startswith(key):
-                    f.write(f'{key} = "{new_value}"\n')
-                else:
-                    f.write(line)
-        import importlib
-        importlib.reload(config)
-        return True
-    except Exception as e:
-        print(f"Ошибка обновления конфига: {e}")
-        return False
-
-async def update_groq_client(new_key: str):
-    global groq_client, GROQ_API_KEY
-    if update_config_value("GROQ_API_KEY", new_key):
-        GROQ_API_KEY = new_key
-        groq_client = AsyncGroq(api_key=new_key)
-        return True
-    return False
-
+# === БЕЗОПАСНАЯ СМЕНА КЛЮЧА GROQ (не трогает config.py) ===
 @dp.message(Command("setgroqkey"))
 @require_private_and_admin
 async def cmd_set_groq_key(message: types.Message):
@@ -788,11 +749,15 @@ async def cmd_set_groq_key(message: types.Message):
     if not new_key.startswith("gsk_"):
         await message.reply("❌ Ключ Groq должен начинаться с 'gsk_'")
         return
-    success = await update_groq_client(new_key)
-    if success:
-        await message.reply("✅ Ключ Groq обновлён. Бот использует новый ключ.")
-    else:
-        await message.reply("❌ Не удалось обновить ключ. Проверьте логи.")
+
+    global groq_client, GROQ_API_KEY
+    try:
+        # Просто пересоздаём клиент, не трогая файл
+        groq_client = AsyncGroq(api_key=new_key)
+        GROQ_API_KEY = new_key
+        await message.reply("✅ Ключ Groq временно изменён (до перезапуска бота).")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка смены ключа: {e}")
 
 # === ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ===
 @dp.message(Command("image"))
@@ -1098,7 +1063,7 @@ async def handle_text(message: types.Message):
 
 # === ЗАПУСК ===
 async def main():
-    await restore_on_startup()  # Автоматическое восстановление при старте (если настроено)
+    await restore_on_startup()
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
