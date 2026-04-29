@@ -18,6 +18,8 @@ from groq import AsyncGroq
 import PyPDF2
 from docx import Document
 import yt_dlp
+from PIL import Image, ImageDraw, ImageFont
+import io
 
 # === НАСТРОЙКИ (ИМПОРТ ИЗ config.py) ===
 try:
@@ -67,6 +69,11 @@ group_control_sessions = {}   # admin_id -> chat_id
 
 class AdminAuth(StatesGroup):
     waiting_for_password = State()
+
+class SkinCard(StatesGroup):
+    waiting_for_skin = State()
+    waiting_for_background = State()
+    waiting_for_nickname = State()
 
 # === ФУНКЦИИ ДЛЯ ГРУПП ===
 async def save_group_info(chat: types.Chat):
@@ -341,101 +348,85 @@ def clean_text_from_mention(text: str, bot_username: str) -> str:
     pattern = rf"@{re.escape(bot_username)}\s*"
     return re.sub(pattern, "", text).strip()
 
-# === ОБЛАЧНОЕ СОХРАНЕНИЕ ===
-BACKUP_FILENAME = "bot_data_backup.zip"
+# === РЕНДЕРИНГ СКИНА ===
+def render_skin_front(skin_path: str, scale: int = 8) -> Image.Image:
+    skin = Image.open(skin_path).convert("RGBA")
+    width, height = skin.size
+    if width != 64 or height not in (64, 32):
+        raise ValueError("Скин должен быть размером 64x64 или 64x32 пикселей.")
+    body_width = 16 * scale
+    body_height = 32 * scale
+    result = Image.new("RGBA", (body_width, body_height), (0, 0, 0, 0))
+    head = skin.crop((8, 8, 16, 16)).resize((8 * scale, 8 * scale), Image.NEAREST)
+    body = skin.crop((20, 20, 28, 32)).resize((8 * scale, 12 * scale), Image.NEAREST)
+    leg_right = skin.crop((4, 20, 8, 32)).resize((4 * scale, 12 * scale), Image.NEAREST)
+    leg_left = skin.crop((20, 52, 24, 64)).resize((4 * scale, 12 * scale), Image.NEAREST) if height == 64 else Image.new("RGBA", (4*scale, 12*scale), (0,0,0,0))
+    arm_right = skin.crop((44, 20, 48, 32)).resize((4 * scale, 12 * scale), Image.NEAREST)
+    arm_left = skin.crop((36, 52, 40, 64)).resize((4 * scale, 12 * scale), Image.NEAREST) if height == 64 else Image.new("RGBA", (4*scale, 12*scale), (0,0,0,0))
+    offset_x = 4 * scale
+    result.paste(head, (offset_x, 0), head)
+    result.paste(body, (offset_x, 8 * scale), body)
+    result.paste(arm_left, (offset_x - 4 * scale, 8 * scale), arm_left)
+    result.paste(arm_right, (offset_x + 8 * scale, 8 * scale), arm_right)
+    result.paste(leg_left, (offset_x, 20 * scale), leg_left)
+    result.paste(leg_right, (offset_x + 4 * scale, 20 * scale), leg_right)
+    return result
 
-async def create_backup_zip() -> str | None:
+async def create_skin_card(skin_path: str, bg_path: str, user_id: int, nickname: str) -> str | None:
     try:
-        backup_path = os.path.join(DOWNLOADS_DIR, BACKUP_FILENAME)
-        with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, _, files in os.walk(DATA_DIR):
-                for file in files:
-                    if file.endswith('.json'):
-                        full_path = os.path.join(root, file)
-                        arcname = os.path.relpath(full_path, BASE_DIR)
-                        zipf.write(full_path, arcname)
-            for root, _, files in os.walk(ACTIVITY_DIR):
-                for file in files:
-                    if file.endswith('.json'):
-                        full_path = os.path.join(root, file)
-                        arcname = os.path.relpath(full_path, BASE_DIR)
-                        zipf.write(full_path, arcname)
-            if os.path.exists(GROUPS_FILE):
-                zipf.write(GROUPS_FILE, os.path.basename(GROUPS_FILE))
-            config_path = os.path.join(BASE_DIR, "config.py")
-            if os.path.exists(config_path):
-                zipf.write(config_path, "config.py")
-        return backup_path
+        avatar = render_skin_front(skin_path, scale=8)
+        bg = Image.open(bg_path).convert("RGBA")
+        target_size = (800, 600)
+        bg = bg.resize(target_size, Image.LANCZOS)
+        avatar_w, avatar_h = avatar.size
+        avatar_x = (target_size[0] - avatar_w) // 2
+        avatar_y = int(target_size[1] * 0.3)
+        bg.paste(avatar, (avatar_x, avatar_y), avatar)
+        draw = ImageDraw.Draw(bg)
+        font_size = 40
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except:
+            font = ImageFont.load_default()
+        text = nickname.upper()
+        text_bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = text_bbox[2] - text_bbox[0]
+        text_h = text_bbox[3] - text_bbox[1]
+        text_x = (target_size[0] - text_w) // 2
+        text_y = avatar_y + avatar_h + 20
+        draw.text((text_x-2, text_y-2), text, font=font, fill="black")
+        draw.text((text_x+2, text_y-2), text, font=font, fill="black")
+        draw.text((text_x-2, text_y+2), text, font=font, fill="black")
+        draw.text((text_x+2, text_y+2), text, font=font, fill="black")
+        draw.text((text_x, text_y), text, font=font, fill="white")
+        result_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_card.png")
+        bg.save(result_path)
+        return result_path
     except Exception as e:
-        print(f"Ошибка создания бэкапа: {e}")
+        print(f"Error creating skin card: {e}")
         return None
-
-async def upload_to_telegram_cloud(file_path: str) -> bool:
-    if not CLOUD_CHANNEL_ID:
-        return False
-    try:
-        await bot.send_document(
-            CLOUD_CHANNEL_ID,
-            FSInputFile(file_path, filename=BACKUP_FILENAME)
-        )
-        return True
-    except Exception as e:
-        print(f"Ошибка отправки в облако: {e}")
-        return False
-
-async def restore_from_telegram_cloud() -> bool:
-    if not CLOUD_CHANNEL_ID:
-        return False
-    try:
-        updates = await bot.get_updates(offset=-10, limit=10, timeout=5)
-        target_message = None
-        for update in reversed(updates):
-            msg = update.message
-            if msg and msg.document and msg.chat.id == CLOUD_CHANNEL_ID:
-                target_message = msg
-                break
-        if not target_message:
-            return False
-        file_id = target_message.document.file_id
-        file = await bot.get_file(file_id)
-        downloaded_path = os.path.join(DOWNLOADS_DIR, "restored_backup.zip")
-        await bot.download_file(file.file_path, downloaded_path)
-
-        with zipfile.ZipFile(downloaded_path, 'r') as zipf:
-            zipf.extractall(BASE_DIR)
-        os.remove(downloaded_path)
-        return True
-    except Exception as e:
-        print(f"Ошибка восстановления: {e}")
-        return False
-
-async def restore_on_startup():
-    if not any(os.listdir(DATA_DIR)) and not os.path.exists(GROUPS_FILE):
-        if CLOUD_CHANNEL_ID:
-            print("Локальные данные отсутствуют. Пробуем восстановить из облака...")
-            if await restore_from_telegram_cloud():
-                print("Восстановление прошло успешно.")
-            else:
-                print("Не удалось восстановить.")
-        else:
-            print("Облачное хранилище не настроено. Пропускаем восстановление.")
 
 # === ХЕНДЛЕРЫ КОМАНД ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
     await message.answer(
-        "👋 Привет! Я бот с Groq и памятью.\n\n"
-        "📝 **Возможности:**\n"
-        "— Отвечаю на текстовые сообщения с учётом истории.\n"
-        "— Принимаю документы (TXT, PDF, DOCX) и анализирую их содержимое.\n"
-        "— Скачиваю видео с YouTube, TikTok и других сайтов. Просто пришли мне ссылку или используй /dl <ссылка>.\n"
-        "— Генерирую картинки по описанию: /image <описание>.\n"
-        "— Если пришлёте фото с подписью, я запомню контекст.\n\n"
-        "🔹 /clear — очистить историю\n"
-        "🔹 /history — показать историю\n"
-        "🔹 /dl <ссылка> — скачать видео\n"
-        "🔹 /image <промпт> — создать изображение"
+        "🚀 <b>Добро пожаловать!</b> Я <b>SkipperAI</b> — ваш персональный интеллектуальный помощник.\n\n"
+        "✨ <b>Что я умею:</b>\n"
+        "• 💬 <i>Общаюсь</i> — веду диалог с памятью (запоминаю контекст)\n"
+        "• 📄 <i>Читаю документы</i> — TXT, PDF, DOCX (просто пришлите файл)\n"
+        "• 🎥 <i>Скачиваю видео</i> — YouTube, TikTok и другие сайты (через /dl или по ссылке)\n"
+        "• 🎨 <i>Рисую картинки</i> — по текстовому описанию (/image)\n"
+        "• 🖼 <i>Работаю с фото</i> — сохраняю контекст, если прислали изображение с подписью\n"
+        "• 🧑‍💻 <i>Создаю карточки со скином Minecraft</i> — /skin (скин + фон + ваш ник)\n\n"
+        "🛠 <b>Команды:</b>\n"
+        "/clear — очистить историю\n"
+        "/history — показать историю\n"
+        "/dl &lt;ссылка&gt; — скачать видео\n"
+        "/image &lt;описание&gt; — создать изображение\n"
+        "/skin — создать карточку со скином\n\n"
+        "👇 Чем могу помочь?",
+        parse_mode="HTML"
     )
 
 @dp.message(Command("clear"))
@@ -512,7 +503,7 @@ async def process_password(message: types.Message, state: FSMContext):
         await message.reply("❌ Неверный пароль.")
     await state.clear()
 
-# === КОМАНДЫ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЕМ (БЕЗ ДЕКОРАТОРА, С ЯВНЫМИ ПРОВЕРКАМИ) ===
+# === КОМАНДЫ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЕМ (БЕЗ ДЕКОРАТОРОВ) ===
 @dp.message(Command("control"))
 async def cmd_control(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
@@ -726,7 +717,7 @@ async def cmd_group_connect(message: types.Message):
         f"Для выхода: /group_connect stop"
     )
 
-# === ОБЛАЧНЫЕ КОМАНДЫ (ТОЛЬКО ДЛЯ АДМИНА) ===
+# === ОБЛАЧНЫЕ КОМАНДЫ ===
 @dp.message(Command("backup"))
 async def cmd_backup(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
@@ -737,7 +728,7 @@ async def cmd_backup(message: types.Message):
         await message.reply("⛔ У вас нет прав для этой команды.")
         return
     if not CLOUD_CHANNEL_ID:
-        await message.reply("❌ ID облачного канала не настроен. Добавьте CLOUD_CHANNEL_ID в config.py.")
+        await message.reply("❌ ID облачного канала не настроен.")
         return
 
     await message.reply("📦 Создаю резервную копию данных...")
@@ -802,7 +793,7 @@ async def cmd_sync_data(message: types.Message):
     else:
         await message.reply("❌ Не удалось восстановить данные из облака.")
 
-# === БЕЗОПАСНАЯ СМЕНА КЛЮЧА GROQ (НЕ ТРОГАЕТ config.py) ===
+# === БЕЗОПАСНАЯ СМЕНА КЛЮЧА GROQ ===
 @dp.message(Command("setgroqkey"))
 async def cmd_set_groq_key(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
@@ -863,6 +854,125 @@ async def cmd_image(message: types.Message):
             await message.reply(f"❌ Не удалось отправить изображение: {e}")
     else:
         await message.reply("❌ Не удалось создать изображение. Попробуйте позже или измените запрос.")
+
+# === КОМАНДА /skin ===
+@dp.message(Command("skin"))
+async def cmd_skin(message: types.Message, state: FSMContext):
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Пожалуйста, используйте команду в личных сообщениях.")
+        return
+    await state.set_state(SkinCard.waiting_for_skin)
+    await message.reply("Пожалуйста, отправьте файл скина Minecraft (картинку 64×64 или 64×32).")
+
+@dp.message(SkinCard.waiting_for_skin, F.document | F.photo)
+async def process_skin_file(message: types.Message, state: FSMContext):
+    await update_user_activity(message.from_user.id, message.from_user)
+    user_id = message.from_user.id
+    if message.document:
+        file_id = message.document.file_id
+        file_name = message.document.file_name or "skin.png"
+    elif message.photo:
+        file_id = message.photo[-1].file_id
+        file_name = "skin.jpg"
+    else:
+        await message.reply("Пожалуйста, отправьте файл скина.")
+        return
+
+    file_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_{file_name}")
+    await download_file(file_id, file_path)
+
+    try:
+        Image.open(file_path).verify()
+    except:
+        os.remove(file_path)
+        await message.reply("❌ Файл не является изображением. Попробуйте снова.")
+        return
+
+    await state.update_data(skin_path=file_path)
+    await state.set_state(SkinCard.waiting_for_background)
+    await message.reply("Отлично! Теперь отправьте изображение для фона карточки.")
+
+@dp.message(SkinCard.waiting_for_skin)
+async def remind_skin_file(message: types.Message):
+    await message.reply("Пожалуйста, отправьте именно файл скина (картинку).")
+
+@dp.message(SkinCard.waiting_for_background, F.document | F.photo)
+async def process_background_file(message: types.Message, state: FSMContext):
+    await update_user_activity(message.from_user.id, message.from_user)
+    user_id = message.from_user.id
+
+    if message.document:
+        file_id = message.document.file_id
+        file_name = message.document.file_name or "background.png"
+    elif message.photo:
+        file_id = message.photo[-1].file_id
+        file_name = "background.jpg"
+    else:
+        await message.reply("Пожалуйста, отправьте изображение фона.")
+        return
+
+    file_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_bg_{file_name}")
+    await download_file(file_id, file_path)
+
+    try:
+        Image.open(file_path).verify()
+    except:
+        os.remove(file_path)
+        await message.reply("❌ Файл не является изображением.")
+        return
+
+    await state.update_data(bg_path=file_path)
+    await state.set_state(SkinCard.waiting_for_nickname)
+    await message.reply("Фон получен. Теперь введите никнейм для карточки (одним сообщением).")
+
+@dp.message(SkinCard.waiting_for_background)
+async def remind_background_file(message: types.Message):
+    await message.reply("Пожалуйста, отправьте изображение фона.")
+
+@dp.message(SkinCard.waiting_for_nickname, F.text)
+async def process_nickname(message: types.Message, state: FSMContext):
+    await update_user_activity(message.from_user.id, message.from_user)
+    user_id = message.from_user.id
+    nickname = message.text.strip()
+
+    if not nickname:
+        await message.reply("Никнейм не может быть пустым. Пожалуйста, введите текст.")
+        return
+
+    data = await state.get_data()
+    skin_path = data.get("skin_path")
+    bg_path = data.get("bg_path")
+
+    if not skin_path or not os.path.exists(skin_path):
+        await message.reply("❌ Скин не найден. Начните заново с /skin.")
+        await state.clear()
+        return
+    if not bg_path or not os.path.exists(bg_path):
+        await message.reply("❌ Фон не найден. Начните заново с /skin.")
+        await state.clear()
+        return
+
+    try:
+        result_image = await create_skin_card(skin_path, bg_path, user_id, nickname)
+        if result_image:
+            with open(result_image, "rb") as f:
+                await message.reply_photo(FSInputFile(result_image), caption="Вот ваша карточка!")
+            os.remove(result_image)
+        else:
+            await message.reply("❌ Не удалось создать карточку.")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка при создании: {e}")
+    finally:
+        if os.path.exists(skin_path):
+            os.remove(skin_path)
+        if os.path.exists(bg_path):
+            os.remove(bg_path)
+        await state.clear()
+
+@dp.message(SkinCard.waiting_for_nickname)
+async def remind_nickname(message: types.Message):
+    await message.reply("Пожалуйста, введите никнейм текстом.")
 
 # === СКАЧИВАНИЕ ВИДЕО ===
 @dp.message(Command("dl"))
