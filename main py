@@ -983,7 +983,7 @@ async def process_nickname(message: types.Message, state: FSMContext):
         else:
             await message.reply("❌ Не удалось создать карточку по неизвестной причине.")
     except ValueError as e:
-        await message.reply(f"❌ {e}")  # Показываем конкретную ошибку
+        await message.reply(f"❌ {e}")
     except Exception as e:
         await message.reply(f"❌ Неожиданная ошибка: {e}")
     finally:
@@ -998,58 +998,71 @@ async def remind_nickname(message: types.Message):
     await message.reply("Пожалуйста, введите никнейм текстом.")
 
 # === РЕНДЕРИНГ СКИНА (УЛУЧШЕННЫЙ) ===
+def render_skin_part(skin: Image.Image, coords: tuple, scale: int, overlay_coords: tuple = None) -> Image.Image:
+    part = skin.crop(coords).resize(((coords[2]-coords[0])*scale, (coords[3]-coords[1])*scale), Image.NEAREST).convert("RGBA")
+    if overlay_coords:
+        overlay = skin.crop(overlay_coords).resize(part.size, Image.NEAREST).convert("RGBA")
+        part = Image.alpha_composite(part, overlay)
+    return part
+
 def render_skin_front(skin_path: str, scale: int = 8) -> Image.Image:
     skin = Image.open(skin_path).convert("RGBA")
-    width, height = skin.size
-    # Проверка минимальной ширины
-    if width < 64:
-        raise ValueError(f"Скин слишком узкий: {width} пикселей. Минимум 64.")
-    # Если ширина больше 64, обрежем или изменим размер
-    if width > 64:
-        skin = skin.resize((64, int(height * 64 / width)), Image.NEAREST)
-        width, height = skin.size
-    # Теперь проверяем высоту
-    if height not in (32, 64):
-        # Для некоторых старых скинов 64x48 — обрежем до 64x32
-        if height == 48:
+    w, h = skin.size
+    if w < 64:
+        skin = skin.resize((64, int(h * 64 / w)), Image.NEAREST)
+        w, h = skin.size
+    if h not in (32, 64):
+        if h == 48:
             skin = skin.crop((0, 0, 64, 32))
-            height = 32
-        elif height > 64:
+            h = 32
+        elif h > 64:
             skin = skin.crop((0, 0, 64, 64))
-            height = 64
-        else:
-            raise ValueError(f"Неизвестный формат скина: {width}x{height}. Допустимы: 64x32, 64x64.")
-    
-    body_width = 16 * scale
-    body_height = 32 * scale
-    result = Image.new("RGBA", (body_width, body_height), (0, 0, 0, 0))
-    # Голова
-    head = skin.crop((8, 8, 16, 16)).resize((8 * scale, 8 * scale), Image.NEAREST)
-    # Тело
-    body = skin.crop((20, 20, 28, 32)).resize((8 * scale, 12 * scale), Image.NEAREST)
-    # Правая нога
-    leg_right = skin.crop((4, 20, 8, 32)).resize((4 * scale, 12 * scale), Image.NEAREST)
-    # Левая нога (только если высота 64)
-    if height == 64:
-        leg_left = skin.crop((20, 52, 24, 64)).resize((4 * scale, 12 * scale), Image.NEAREST)
+            h = 64
+
+    head = render_skin_part(skin, (8, 8, 16, 16), scale, (40, 8, 48, 16))
+    body = render_skin_part(skin, (20, 20, 28, 32), scale, (20, 36, 28, 48))
+    leg_right = render_skin_part(skin, (4, 20, 8, 32), scale, (4, 36, 8, 48))
+    arm_right = render_skin_part(skin, (44, 20, 48, 32), scale, (44, 36, 48, 48))
+
+    if h == 64:
+        leg_left = render_skin_part(skin, (20, 52, 24, 64), scale, (20, 52, 24, 64))
+        arm_left = render_skin_part(skin, (36, 52, 40, 64), scale, (36, 52, 40, 64))
     else:
-        leg_left = Image.new("RGBA", (4 * scale, 12 * scale), (0, 0, 0, 0))
-    # Правая рука
-    arm_right = skin.crop((44, 20, 48, 32)).resize((4 * scale, 12 * scale), Image.NEAREST)
-    # Левая рука (только если высота 64)
-    if height == 64:
-        arm_left = skin.crop((36, 52, 40, 64)).resize((4 * scale, 12 * scale), Image.NEAREST)
+        leg_left = Image.new("RGBA", (4*scale, 12*scale), (0,0,0,0))
+        arm_left = Image.new("RGBA", (4*scale, 12*scale), (0,0,0,0))
+
+    head_back = render_skin_part(skin, (24, 8, 32, 16), scale, (48, 8, 56, 16))
+    body_back = render_skin_part(skin, (32, 20, 40, 32), scale, (32, 36, 40, 48))
+    leg_right_back = render_skin_part(skin, (12, 20, 16, 32), scale, (12, 36, 16, 48))
+    arm_right_back = render_skin_part(skin, (52, 20, 56, 32), scale, (52, 36, 56, 48))
+    if h == 64:
+        leg_left_back = render_skin_part(skin, (28, 52, 32, 64), scale, (28, 52, 32, 64))
+        arm_left_back = render_skin_part(skin, (44, 52, 48, 64), scale, (44, 52, 48, 64))
     else:
-        arm_left = Image.new("RGBA", (4 * scale, 12 * scale), (0, 0, 0, 0))
-    
-    offset_x = 4 * scale
-    result.paste(head, (offset_x, 0), head)
-    result.paste(body, (offset_x, 8 * scale), body)
-    result.paste(arm_left, (offset_x - 4 * scale, 8 * scale), arm_left)
-    result.paste(arm_right, (offset_x + 8 * scale, 8 * scale), arm_right)
-    result.paste(leg_left, (offset_x, 20 * scale), leg_left)
-    result.paste(leg_right, (offset_x + 4 * scale, 20 * scale), leg_right)
-    return result
+        leg_left_back = Image.new("RGBA", (4*scale, 12*scale), (0,0,0,0))
+        arm_left_back = Image.new("RGBA", (4*scale, 12*scale), (0,0,0,0))
+
+    front = Image.new("RGBA", (16*scale, 32*scale), (0,0,0,0))
+    front.paste(head, (4*scale, 0), head)
+    front.paste(body, (4*scale, 8*scale), body)
+    front.paste(arm_right, (8*scale, 8*scale), arm_right)
+    front.paste(arm_left, (0, 8*scale), arm_left)
+    front.paste(leg_right, (8*scale, 20*scale), leg_right)
+    front.paste(leg_left, (4*scale, 20*scale), leg_left)
+
+    back = Image.new("RGBA", (16*scale, 32*scale), (0,0,0,0))
+    back.paste(head_back, (4*scale, 0), head_back)
+    back.paste(body_back, (4*scale, 8*scale), body_back)
+    back.paste(arm_right_back, (8*scale, 8*scale), arm_right_back)
+    back.paste(arm_left_back, (0, 8*scale), arm_left_back)
+    back.paste(leg_right_back, (8*scale, 20*scale), leg_right_back)
+    back.paste(leg_left_back, (4*scale, 20*scale), leg_left_back)
+
+    combined = Image.new("RGBA", (18*scale, 34*scale), (0,0,0,0))
+    back.putalpha(128)
+    combined.paste(back, (2*scale, 2*scale), back)
+    combined.paste(front, (0, 0), front)
+    return combined
 
 async def create_skin_card(skin_path: str, bg_path: str, user_id: int, nickname: str) -> str | None:
     try:
@@ -1057,27 +1070,45 @@ async def create_skin_card(skin_path: str, bg_path: str, user_id: int, nickname:
         bg = Image.open(bg_path).convert("RGBA")
         target_size = (800, 600)
         bg = bg.resize(target_size, Image.LANCZOS)
-        avatar_w, avatar_h = avatar.size
-        avatar_x = (target_size[0] - avatar_w) // 2
-        avatar_y = int(target_size[1] * 0.3)
-        bg.paste(avatar, (avatar_x, avatar_y), avatar)
+        av_w, av_h = avatar.size
+        av_x = (target_size[0] - av_w) // 2
+        av_y = int(target_size[1] * 0.2)
+        bg.paste(avatar, (av_x, av_y), avatar)
+
         draw = ImageDraw.Draw(bg)
-        font_size = 40
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except:
+        font_size = 48
+        font = None
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans.ttf",
+            "arial.ttf",
+            "Arial.ttf",
+        ]
+        for fp in font_paths:
+            try:
+                font = ImageFont.truetype(fp, font_size)
+                break
+            except:
+                continue
+        if font is None:
             font = ImageFont.load_default()
+            font_size = 16
+
         text = nickname.upper()
-        text_bbox = draw.textbbox((0, 0), text, font=font)
-        text_w = text_bbox[2] - text_bbox[0]
-        text_h = text_bbox[3] - text_bbox[1]
-        text_x = (target_size[0] - text_w) // 2
-        text_y = avatar_y + avatar_h + 20
-        draw.text((text_x-2, text_y-2), text, font=font, fill="black")
-        draw.text((text_x+2, text_y-2), text, font=font, fill="black")
-        draw.text((text_x-2, text_y+2), text, font=font, fill="black")
-        draw.text((text_x+2, text_y+2), text, font=font, fill="black")
-        draw.text((text_x, text_y), text, font=font, fill="white")
+        if font:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        else:
+            tw, th = draw.textsize(text)
+        tx = (target_size[0] - tw) // 2
+        ty = av_y + av_h + 30
+
+        for dx, dy in [(-2,-2), (2,-2), (-2,2), (2,2)]:
+            draw.text((tx+dx, ty+dy), text, font=font, fill="black")
+        draw.text((tx, ty), text, font=font, fill="white")
+
         result_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_card.png")
         bg.save(result_path)
         return result_path
