@@ -14,22 +14,20 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import FSInputFile
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 import PyPDF2
 from docx import Document
 import yt_dlp
-from PIL import Image, ImageDraw, ImageFont
-import io
 
 # === НАСТРОЙКИ (ИМПОРТ ИЗ config.py) ===
 try:
     from config import (
-        TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY
+        TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY
     )
 except ImportError:
     raise ImportError(
         "Не найден файл config.py. Создайте его с переменными:\n"
-        "TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY"
+        "TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY"
     )
 
 # CLOUD_CHANNEL_ID – опциональный параметр
@@ -41,13 +39,32 @@ try:
 except (ImportError, ValueError):
     pass
 
-if not all([TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY]):
-    raise ValueError("TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY должны быть заполнены")
+if not all([TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY]):
+    raise ValueError("TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY должны быть заполнены")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+
+# OpenRouter — OpenAI-совместимый API
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Цепочка бесплатных моделей (по убыванию приоритета).
+# Источник: openrouter.ai/collections/free-models, апрель 2026.
+# При недоступности одной бот автоматически переходит к следующей.
+#
+# 1. Llama 3.3 70B  — самая популярная бесплатная модель для общего чата на OpenRouter
+# 2. Gemma 4 31B    — от Google, 256K контекст, сильное рассуждение
+# 3. GPT-OSS 20B    — от OpenAI, первая open-weight модель под Apache 2.0
+AI_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-4-31b-it:free",
+    "openai/gpt-oss-20b:free",
+]
+
+ai_client = AsyncOpenAI(
+    api_key=OPENROUTER_API_KEY,
+    base_url=OPENROUTER_BASE_URL,
+)
 
 # Папки
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +79,31 @@ os.makedirs(ACTIVITY_DIR, exist_ok=True)
 MAX_HISTORY_LENGTH = 10
 ONLINE_THRESHOLD = 300  # 5 минут
 
+# === AI ЗАПРОС С АВТОМАТИЧЕСКИМ FALLBACK ===
+async def ai_request(messages: list) -> str:
+    """
+    Отправляет запрос к OpenRouter.
+    Перебирает модели по списку AI_MODELS: если одна недоступна — переходит к следующей.
+    """
+    for model in AI_MODELS:
+        try:
+            response = await ai_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=1024,
+                extra_headers={
+                    "HTTP-Referer": "https://t.me",
+                    "X-Title": "TelegramBot",
+                }
+            )
+            text = response.choices[0].message.content
+            if text:
+                return text
+        except Exception as e:
+            print(f"[ai] Модель {model} недоступна: {e}")
+            continue
+    raise RuntimeError("Все AI-модели недоступны. Попробуйте позже.")
+
 # === ХРАНЕНИЕ СЕССИЙ ===
 admin_sessions = set()
 control_sessions = {}         # admin_id -> user_id
@@ -69,11 +111,6 @@ group_control_sessions = {}   # admin_id -> chat_id
 
 class AdminAuth(StatesGroup):
     waiting_for_password = State()
-
-class SkinCard(StatesGroup):
-    waiting_for_skin = State()
-    waiting_for_background = State()
-    waiting_for_nickname = State()
 
 # === ФУНКЦИИ ДЛЯ ГРУПП ===
 async def save_group_info(chat: types.Chat):
@@ -351,103 +388,270 @@ def clean_text_from_mention(text: str, bot_username: str) -> str:
 # === ОБЛАЧНОЕ СОХРАНЕНИЕ ===
 BACKUP_FILENAME = "bot_data_backup.zip"
 
+# Файл для хранения message_id последнего бэкапа в канале
+BACKUP_INDEX_FILE = os.path.join(BASE_DIR, "last_backup_msg_id.txt")
+
+
+def _save_backup_msg_id(msg_id: int):
+    """Сохраняет message_id последнего бэкапа локально."""
+    try:
+        with open(BACKUP_INDEX_FILE, 'w') as f:
+            f.write(str(msg_id))
+    except Exception as e:
+        print(f"[backup] Не удалось сохранить msg_id: {e}")
+
+
+def _load_backup_msg_id() -> int | None:
+    """Читает message_id последнего бэкапа из локального файла."""
+    try:
+        if os.path.exists(BACKUP_INDEX_FILE):
+            with open(BACKUP_INDEX_FILE, 'r') as f:
+                val = f.read().strip()
+                return int(val) if val else None
+    except Exception as e:
+        print(f"[backup] Не удалось прочитать msg_id: {e}")
+    return None
+
+
 async def create_backup_zip() -> str | None:
+    """Создаёт ZIP-архив со всеми данными бота."""
     try:
         backup_path = os.path.join(DOWNLOADS_DIR, BACKUP_FILENAME)
         with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # История диалогов
             for root, _, files in os.walk(DATA_DIR):
                 for file in files:
                     if file.endswith('.json'):
                         full_path = os.path.join(root, file)
                         arcname = os.path.relpath(full_path, BASE_DIR)
                         zipf.write(full_path, arcname)
+            # Активность пользователей
             for root, _, files in os.walk(ACTIVITY_DIR):
                 for file in files:
                     if file.endswith('.json'):
                         full_path = os.path.join(root, file)
                         arcname = os.path.relpath(full_path, BASE_DIR)
                         zipf.write(full_path, arcname)
+            # Список групп
             if os.path.exists(GROUPS_FILE):
                 zipf.write(GROUPS_FILE, os.path.basename(GROUPS_FILE))
-            config_path = os.path.join(BASE_DIR, "config.py")
-            if os.path.exists(config_path):
-                zipf.write(config_path, "config.py")
+        print(f"[backup] Архив создан: {backup_path}")
         return backup_path
     except Exception as e:
-        print(f"Ошибка создания бэкапа: {e}")
+        print(f"[backup] Ошибка создания архива: {e}")
         return None
 
+
 async def upload_to_telegram_cloud(file_path: str) -> bool:
+    """
+    Отправляет ZIP в приватный канал и сохраняет message_id отправленного сообщения.
+    message_id нужен для надёжного скачивания при восстановлении.
+    """
     if not CLOUD_CHANNEL_ID:
+        print("[backup] CLOUD_CHANNEL_ID не задан, пропускаем.")
         return False
     try:
-        await bot.send_document(
+        sent = await bot.send_document(
             CLOUD_CHANNEL_ID,
-            FSInputFile(file_path, filename=BACKUP_FILENAME)
+            FSInputFile(file_path, filename=BACKUP_FILENAME),
+            caption=f"🗂 Бэкап | {time.strftime('%Y-%m-%d %H:%M:%S')}"
         )
+        _save_backup_msg_id(sent.message_id)
+        print(f"[backup] Бэкап отправлен в канал, msg_id={sent.message_id}")
         return True
     except Exception as e:
-        print(f"Ошибка отправки в облако: {e}")
+        print(f"[backup] Ошибка отправки в канал: {e}")
         return False
+
+
+async def _find_latest_backup_msg_id() -> int | None:
+    """
+    Ищет message_id последнего бэкапа.
+    Сначала проверяет локальный файл-индекс, потом перебирает
+    последние сообщения канала через forward_messages-трюк.
+    """
+    # 1. Быстрый путь — локальный индекс
+    local_id = _load_backup_msg_id()
+    if local_id:
+        print(f"[backup] Найден локальный msg_id={local_id}")
+        return local_id
+
+    # 2. Медленный путь — перебираем последние ~50 сообщений канала назад
+    # Telegram Bot API не имеет getChatHistory, но позволяет forwardMessage:
+    # если msg_id существует и содержит документ — это наш бэкап.
+    # Стартуем с большого числа и идём вниз пока не найдём документ.
+    print("[backup] Локальный индекс отсутствует, ищем бэкап в канале...")
+    if not CLOUD_CHANNEL_ID:
+        return None
+
+    # Пробуем получить последнее сообщение канала через copyMessage (оно всегда последнее)
+    # Будем искать в диапазоне последних 200 message_id
+    # Для этого используем трюк: отправляем заглушку и смотрим её message_id
+    probe_msg = None
+    try:
+        probe_msg = await bot.send_message(CLOUD_CHANNEL_ID, "🔍 Поиск бэкапа...")
+        max_id = probe_msg.message_id
+        await bot.delete_message(CLOUD_CHANNEL_ID, probe_msg.message_id)
+        probe_msg = None
+    except Exception as e:
+        print(f"[backup] Не удалось определить последний msg_id канала: {e}")
+        if probe_msg:
+            try:
+                await bot.delete_message(CLOUD_CHANNEL_ID, probe_msg.message_id)
+            except:
+                pass
+        return None
+
+    # Перебираем последние 200 сообщений в поисках документа с нужным именем
+    search_limit = min(max_id, 200)
+    for msg_id in range(max_id - 1, max_id - search_limit - 1, -1):
+        if msg_id <= 0:
+            break
+        try:
+            # forward в скрытый чат не работает через Bot API без прав.
+            # Единственный способ — копировать сообщение в служебный чат.
+            # Но у нас нет такого чата. Используем getFile через file_id,
+            # который получаем через forwardMessage к самому боту.
+            # Однако проще: просто пробуем скопировать сообщение во временный
+            # буфер — сам канал — и сразу удалить.
+            # Самый надёжный вариант без side-effects: используем
+            # bot.copy_message, ловим исключение если сообщения нет.
+            copied = await bot.copy_message(
+                chat_id=CLOUD_CHANNEL_ID,
+                from_chat_id=CLOUD_CHANNEL_ID,
+                message_id=msg_id
+            )
+            # Если дошли сюда — сообщение существует. Проверяем это через forward.
+            # Удаляем копию и пробуем скачать оригинал.
+            await bot.delete_message(CLOUD_CHANNEL_ID, copied.message_id)
+
+            # Теперь нужно узнать, документ ли это. Форвардим в личку боту — нельзя.
+            # Но мы можем попробовать скачать через file_id, которого у нас нет.
+            # Проблема: Bot API не возвращает содержимое сообщений канала напрямую.
+            # Решение: сохраняем msg_id и пробуем скачать в restore-функции,
+            # она сама проверит документ.
+            _save_backup_msg_id(msg_id)
+            print(f"[backup] Найдено сообщение msg_id={msg_id} в канале")
+            return msg_id
+        except Exception:
+            continue
+
+    print("[backup] Бэкапы в канале не найдены.")
+    return None
+
 
 async def restore_from_telegram_cloud() -> bool:
-    if not CLOUD_CHANNEL_ID:
-        return False
-    try:
-        updates = await bot.get_updates(offset=-10, limit=10, timeout=5)
-        target_message = None
-        for update in reversed(updates):
-            msg = update.message
-            if msg and msg.document and msg.chat.id == CLOUD_CHANNEL_ID:
-                target_message = msg
-                break
-        if not target_message:
-            return False
-        file_id = target_message.document.file_id
-        file = await bot.get_file(file_id)
-        downloaded_path = os.path.join(DOWNLOADS_DIR, "restored_backup.zip")
-        await bot.download_file(file.file_path, downloaded_path)
+    """
+    Скачивает последний бэкап из приватного канала и распаковывает данные.
 
+    Алгоритм:
+    1. Берём msg_id из локального индекса (быстро) или ищем в канале (медленно).
+    2. Форвардим сообщение с документом в Saved Messages бота, чтобы получить file_id.
+    3. Скачиваем файл, распаковываем, удаляем временную копию.
+    """
+    if not CLOUD_CHANNEL_ID:
+        print("[backup] CLOUD_CHANNEL_ID не задан.")
+        return False
+
+    msg_id = await _find_latest_backup_msg_id()
+    if not msg_id:
+        print("[backup] Не удалось найти msg_id бэкапа.")
+        return False
+
+    forwarded = None
+    downloaded_path = os.path.join(DOWNLOADS_DIR, "restored_backup.zip")
+
+    try:
+        # Форвардим сообщение из канала себе (в чат бота с самим собой = bot.id)
+        # чтобы получить объект Message с document.file_id
+        bot_info = await bot.get_me()
+        forwarded = await bot.forward_message(
+            chat_id=bot_info.id,
+            from_chat_id=CLOUD_CHANNEL_ID,
+            message_id=msg_id
+        )
+
+        if not forwarded.document:
+            print(f"[backup] Сообщение msg_id={msg_id} не содержит документа.")
+            # Сбрасываем индекс — он был неверным
+            if os.path.exists(BACKUP_INDEX_FILE):
+                os.remove(BACKUP_INDEX_FILE)
+            return False
+
+        if forwarded.document.file_name != BACKUP_FILENAME:
+            print(f"[backup] Документ называется '{forwarded.document.file_name}', ожидалось '{BACKUP_FILENAME}'.")
+            return False
+
+        # Скачиваем
+        file_info = await bot.get_file(forwarded.document.file_id)
+        await bot.download_file(file_info.file_path, downloaded_path)
+        print(f"[backup] Архив скачан: {downloaded_path}")
+
+        # Распаковываем
         with zipfile.ZipFile(downloaded_path, 'r') as zipf:
             zipf.extractall(BASE_DIR)
-        os.remove(downloaded_path)
+        print("[backup] Данные успешно восстановлены.")
         return True
+
     except Exception as e:
-        print(f"Ошибка восстановления: {e}")
+        print(f"[backup] Ошибка восстановления: {e}")
         return False
+    finally:
+        # Удаляем форвард из Saved Messages чтобы не засорять
+        if forwarded:
+            try:
+                await bot.delete_message(chat_id=forwarded.chat.id, message_id=forwarded.message_id)
+            except:
+                pass
+        # Удаляем временный файл
+        if os.path.exists(downloaded_path):
+            try:
+                os.remove(downloaded_path)
+            except:
+                pass
+
 
 async def restore_on_startup():
-    if not any(os.listdir(DATA_DIR)) and not os.path.exists(GROUPS_FILE):
-        if CLOUD_CHANNEL_ID:
-            print("Локальные данные отсутствуют. Пробуем восстановить из облака...")
-            if await restore_from_telegram_cloud():
-                print("Восстановление прошло успешно.")
-            else:
-                print("Не удалось восстановить.")
-        else:
-            print("Облачное хранилище не настроено. Пропускаем восстановление.")
+    """
+    Проверка при старте: если локальных данных нет — тянем бэкап из канала.
+    Запускается до начала поллинга.
+    """
+    has_local_data = (
+        any(f.endswith('.json') for f in os.listdir(DATA_DIR))
+        or os.path.exists(GROUPS_FILE)
+    )
+
+    if has_local_data:
+        print("[backup] Локальные данные найдены, восстановление не нужно.")
+        return
+
+    if not CLOUD_CHANNEL_ID:
+        print("[backup] Облачное хранилище не настроено, пропускаем восстановление.")
+        return
+
+    print("[backup] Локальные данные отсутствуют — пробуем восстановить из облака...")
+    success = await restore_from_telegram_cloud()
+    if success:
+        print("[backup] ✅ Данные восстановлены из облака.")
+    else:
+        print("[backup] ⚠️ Не удалось восстановить данные. Бот запустится с чистого листа.")
 
 # === ХЕНДЛЕРЫ КОМАНД ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
     await message.answer(
-        "🚀 <b>Добро пожаловать!</b> Я <b>SkipperAI</b> — ваш персональный интеллектуальный помощник.\n\n"
-        "✨ <b>Что я умею:</b>\n"
-        "• 💬 <i>Общаюсь</i> — веду диалог с памятью (запоминаю контекст)\n"
-        "• 📄 <i>Читаю документы</i> — TXT, PDF, DOCX (просто пришлите файл)\n"
-        "• 🎥 <i>Скачиваю видео</i> — YouTube, TikTok и другие сайты (через /dl или по ссылке)\n"
-        "• 🎨 <i>Рисую картинки</i> — по текстовому описанию (/image)\n"
-        "• 🖼 <i>Работаю с фото</i> — сохраняю контекст, если прислали изображение с подписью\n"
-        "• 🧑‍💻 <i>Создаю карточки со скином Minecraft</i> — /skin (скин + фон + ваш ник)\n\n"
-        "🛠 <b>Команды:</b>\n"
-        "/clear — очистить историю\n"
-        "/history — показать историю\n"
-        "/dl &lt;ссылка&gt; — скачать видео\n"
-        "/image &lt;описание&gt; — создать изображение\n"
-        "/skin — создать карточку со скином\n\n"
-        "👇 Чем могу помочь?",
-        parse_mode="HTML"
+        "👋 Привет! Я бот с Groq и памятью.\n\n"
+        "📝 **Возможности:**\n"
+        "— Отвечаю на текстовые сообщения с учётом истории.\n"
+        "— Принимаю документы (TXT, PDF, DOCX) и анализирую их содержимое.\n"
+        "— Скачиваю видео с YouTube, TikTok и других сайтов. Просто пришли мне ссылку или используй /dl <ссылка>.\n"
+        "— Генерирую картинки по описанию: /image <описание>.\n"
+        "— Если пришлёте фото с подписью, я запомню контекст.\n\n"
+        "🔹 /clear — очистить историю\n"
+        "🔹 /history — показать историю\n"
+        "🔹 /dl <ссылка> — скачать видео\n"
+        "🔹 /image <промпт> — создать изображение"
     )
 
 @dp.message(Command("clear"))
@@ -515,16 +719,15 @@ async def process_password(message: types.Message, state: FSMContext):
             "/groups — список групп\n"
             "/group_connect <айди> — управлять группой\n"
             "/group_connect stop — завершить управление группой\n"
-            "/setgroqkey <ключ> — временно сменить ключ Groq (на одну сессию)\n"
-            "/backup — создать и отправить бекап в облако\n"
-            "/restore — восстановить данные из облака\n"
-            "/sync_data — полная синхронизация с облаком"
+            "/setaikey <ключ> — временно сменить ключ OpenRouter (на одну сессию)\n"
+            "/backup — создать бэкап и сохранить в облако\n"
+            "/restore — восстановить данные из облака"
         )
     else:
         await message.reply("❌ Неверный пароль.")
     await state.clear()
 
-# === КОМАНДЫ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЕМ ===
+# === КОМАНДЫ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЕМ (БЕЗ ДЕКОРАТОРА, С ЯВНЫМИ ПРОВЕРКАМИ) ===
 @dp.message(Command("control"))
 async def cmd_control(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
@@ -738,7 +941,7 @@ async def cmd_group_connect(message: types.Message):
         f"Для выхода: /group_connect stop"
     )
 
-# === ОБЛАЧНЫЕ КОМАНДЫ ===
+# === ОБЛАЧНЫЕ КОМАНДЫ (ТОЛЬКО ДЛЯ АДМИНА) ===
 @dp.message(Command("backup"))
 async def cmd_backup(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
@@ -752,17 +955,29 @@ async def cmd_backup(message: types.Message):
         await message.reply("❌ ID облачного канала не настроен. Добавьте CLOUD_CHANNEL_ID в config.py.")
         return
 
-    await message.reply("📦 Создаю резервную копию данных...")
+    status_msg = await message.reply("📦 Создаю архив данных...")
     backup_path = await create_backup_zip()
     if not backup_path:
-        await message.reply("❌ Не удалось создать архив с данными.")
+        await status_msg.edit_text("❌ Не удалось создать архив. Проверьте логи.")
         return
-    if await upload_to_telegram_cloud(backup_path):
-        await message.reply("✅ Данные успешно отправлены в облачное хранилище.")
-    else:
-        await message.reply("❌ Не удалось отправить данные в облако.")
+
+    await status_msg.edit_text("☁️ Отправляю архив в канал...")
+    success = await upload_to_telegram_cloud(backup_path)
+
     if os.path.exists(backup_path):
         os.remove(backup_path)
+
+    if success:
+        msg_id = _load_backup_msg_id()
+        await status_msg.edit_text(
+            f"✅ Бэкап успешно сохранён в облако.\n"
+            f"📌 msg_id: `{msg_id}`\n"
+            f"🕐 {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            parse_mode="Markdown"
+        )
+    else:
+        await status_msg.edit_text("❌ Не удалось отправить архив в канал. Проверьте права бота в канале.")
+
 
 @dp.message(Command("restore"))
 async def cmd_restore(message: types.Message):
@@ -777,46 +992,23 @@ async def cmd_restore(message: types.Message):
         await message.reply("❌ ID облачного канала не настроен.")
         return
 
-    await message.reply("🔄 Восстанавливаю данные из облака...")
-    if await restore_from_telegram_cloud():
-        await message.reply("✅ Данные успешно восстановлены из облака.")
+    status_msg = await message.reply("🔍 Ищу последний бэкап в канале...")
+    success = await restore_from_telegram_cloud()
+
+    if success:
+        await status_msg.edit_text("✅ Данные успешно восстановлены из облака.")
     else:
-        await message.reply("❌ Не удалось восстановить данные из облака.")
+        await status_msg.edit_text(
+            "❌ Не удалось восстановить данные.\n\n"
+            "Возможные причины:\n"
+            "• Бэкап ещё не создавался (/backup)\n"
+            "• Бот не является администратором канала\n"
+            "• В канале нет сообщений с файлом `bot_data_backup.zip`"
+        )
 
-@dp.message(Command("sync_data"))
-async def cmd_sync_data(message: types.Message):
-    await update_user_activity(message.from_user.id, message.from_user)
-    if message.chat.type != "private":
-        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
-        return
-    if message.from_user.id not in admin_sessions:
-        await message.reply("⛔ У вас нет прав для этой команды.")
-        return
-    if not CLOUD_CHANNEL_ID:
-        await message.reply("❌ ID облачного канала не настроен.")
-        return
-
-    await message.reply("🔁 Синхронизирую данные с облаком...")
-    backup_path = await create_backup_zip()
-    if not backup_path:
-        await message.reply("❌ Не удалось создать архив.")
-        return
-    if not await upload_to_telegram_cloud(backup_path):
-        await message.reply("❌ Не удалось отправить данные.")
-        if os.path.exists(backup_path):
-            os.remove(backup_path)
-        return
-    if os.path.exists(backup_path):
-        os.remove(backup_path)
-
-    if await restore_from_telegram_cloud():
-        await message.reply("✅ Данные синхронизированы с облаком.")
-    else:
-        await message.reply("❌ Не удалось восстановить данные из облака.")
-
-# === БЕЗОПАСНАЯ СМЕНА КЛЮЧА GROQ ===
-@dp.message(Command("setgroqkey"))
-async def cmd_set_groq_key(message: types.Message):
+# === СМЕНА КЛЮЧА OPENROUTER (НЕ ТРОГАЕТ config.py) ===
+@dp.message(Command("setaikey"))
+async def cmd_set_ai_key(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
     if message.chat.type != "private":
         await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
@@ -827,18 +1019,18 @@ async def cmd_set_groq_key(message: types.Message):
 
     args = message.text.split()
     if len(args) != 2:
-        await message.reply("Используйте: /setgroqkey <новый_ключ>")
+        await message.reply("Используйте: /setaikey <новый_ключ>")
         return
     new_key = args[1]
-    if not new_key.startswith("gsk_"):
-        await message.reply("❌ Ключ Groq должен начинаться с 'gsk_'")
+    if not new_key.startswith("sk-or-"):
+        await message.reply("❌ Ключ OpenRouter должен начинаться с 'sk-or-'")
         return
 
-    global groq_client, GROQ_API_KEY
+    global ai_client, OPENROUTER_API_KEY
     try:
-        groq_client = AsyncGroq(api_key=new_key)
-        GROQ_API_KEY = new_key
-        await message.reply("✅ Ключ Groq временно изменён (до перезапуска бота).")
+        ai_client = AsyncOpenAI(api_key=new_key, base_url=OPENROUTER_BASE_URL)
+        OPENROUTER_API_KEY = new_key
+        await message.reply("✅ Ключ OpenRouter временно изменён (до перезапуска бота).")
     except Exception as e:
         await message.reply(f"❌ Ошибка смены ключа: {e}")
 
@@ -875,245 +1067,6 @@ async def cmd_image(message: types.Message):
             await message.reply(f"❌ Не удалось отправить изображение: {e}")
     else:
         await message.reply("❌ Не удалось создать изображение. Попробуйте позже или измените запрос.")
-
-# === КОМАНДА /skin (УЛУЧШЕННАЯ) ===
-@dp.message(Command("skin"))
-async def cmd_skin(message: types.Message, state: FSMContext):
-    await update_user_activity(message.from_user.id, message.from_user)
-    if message.chat.type != "private":
-        await message.reply("⛔ Пожалуйста, используйте команду в личных сообщениях.")
-        return
-    await state.set_state(SkinCard.waiting_for_skin)
-    await message.reply("Пожалуйста, отправьте файл скина Minecraft (картинку 64×64 или 64×32).")
-
-@dp.message(SkinCard.waiting_for_skin, F.document | F.photo)
-async def process_skin_file(message: types.Message, state: FSMContext):
-    await update_user_activity(message.from_user.id, message.from_user)
-    user_id = message.from_user.id
-    if message.document:
-        file_id = message.document.file_id
-        file_name = message.document.file_name or "skin.png"
-    elif message.photo:
-        file_id = message.photo[-1].file_id
-        file_name = "skin.jpg"
-    else:
-        await message.reply("Пожалуйста, отправьте файл скина.")
-        return
-
-    file_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_{file_name}")
-    await download_file(file_id, file_path)
-
-    try:
-        Image.open(file_path).verify()
-    except:
-        os.remove(file_path)
-        await message.reply("❌ Файл не является изображением. Попробуйте снова.")
-        return
-
-    await state.update_data(skin_path=file_path)
-    await state.set_state(SkinCard.waiting_for_background)
-    await message.reply("Отлично! Теперь отправьте изображение для фона карточки.")
-
-@dp.message(SkinCard.waiting_for_skin)
-async def remind_skin_file(message: types.Message):
-    await message.reply("Пожалуйста, отправьте именно файл скина (картинку).")
-
-@dp.message(SkinCard.waiting_for_background, F.document | F.photo)
-async def process_background_file(message: types.Message, state: FSMContext):
-    await update_user_activity(message.from_user.id, message.from_user)
-    user_id = message.from_user.id
-
-    if message.document:
-        file_id = message.document.file_id
-        file_name = message.document.file_name or "background.png"
-    elif message.photo:
-        file_id = message.photo[-1].file_id
-        file_name = "background.jpg"
-    else:
-        await message.reply("Пожалуйста, отправьте изображение фона.")
-        return
-
-    file_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_bg_{file_name}")
-    await download_file(file_id, file_path)
-
-    try:
-        Image.open(file_path).verify()
-    except:
-        os.remove(file_path)
-        await message.reply("❌ Файл не является изображением.")
-        return
-
-    await state.update_data(bg_path=file_path)
-    await state.set_state(SkinCard.waiting_for_nickname)
-    await message.reply("Фон получен. Теперь введите никнейм для карточки (одним сообщением).")
-
-@dp.message(SkinCard.waiting_for_background)
-async def remind_background_file(message: types.Message):
-    await message.reply("Пожалуйста, отправьте изображение фона.")
-
-@dp.message(SkinCard.waiting_for_nickname, F.text)
-async def process_nickname(message: types.Message, state: FSMContext):
-    await update_user_activity(message.from_user.id, message.from_user)
-    user_id = message.from_user.id
-    nickname = message.text.strip()
-
-    if not nickname:
-        await message.reply("Никнейм не может быть пустым. Пожалуйста, введите текст.")
-        return
-
-    data = await state.get_data()
-    skin_path = data.get("skin_path")
-    bg_path = data.get("bg_path")
-
-    if not skin_path or not os.path.exists(skin_path):
-        await message.reply("❌ Скин не найден. Начните заново с /skin.")
-        await state.clear()
-        return
-    if not bg_path or not os.path.exists(bg_path):
-        await message.reply("❌ Фон не найден. Начните заново с /skin.")
-        await state.clear()
-        return
-
-    try:
-        result_image = await create_skin_card(skin_path, bg_path, user_id, nickname)
-        if result_image:
-            with open(result_image, "rb") as f:
-                await message.reply_photo(FSInputFile(result_image), caption="Вот ваша карточка!")
-            os.remove(result_image)
-        else:
-            await message.reply("❌ Не удалось создать карточку по неизвестной причине.")
-    except ValueError as e:
-        await message.reply(f"❌ {e}")
-    except Exception as e:
-        await message.reply(f"❌ Неожиданная ошибка: {e}")
-    finally:
-        if os.path.exists(skin_path):
-            os.remove(skin_path)
-        if os.path.exists(bg_path):
-            os.remove(bg_path)
-        await state.clear()
-
-@dp.message(SkinCard.waiting_for_nickname)
-async def remind_nickname(message: types.Message):
-    await message.reply("Пожалуйста, введите никнейм текстом.")
-
-# === РЕНДЕРИНГ СКИНА (УЛУЧШЕННЫЙ) ===
-def render_skin_part(skin: Image.Image, coords: tuple, scale: int, overlay_coords: tuple = None) -> Image.Image:
-    part = skin.crop(coords).resize(((coords[2]-coords[0])*scale, (coords[3]-coords[1])*scale), Image.NEAREST).convert("RGBA")
-    if overlay_coords:
-        overlay = skin.crop(overlay_coords).resize(part.size, Image.NEAREST).convert("RGBA")
-        part = Image.alpha_composite(part, overlay)
-    return part
-
-def render_skin_front(skin_path: str, scale: int = 8) -> Image.Image:
-    skin = Image.open(skin_path).convert("RGBA")
-    w, h = skin.size
-    if w < 64:
-        skin = skin.resize((64, int(h * 64 / w)), Image.NEAREST)
-        w, h = skin.size
-    if h not in (32, 64):
-        if h == 48:
-            skin = skin.crop((0, 0, 64, 32))
-            h = 32
-        elif h > 64:
-            skin = skin.crop((0, 0, 64, 64))
-            h = 64
-
-    head = render_skin_part(skin, (8, 8, 16, 16), scale, (40, 8, 48, 16))
-    body = render_skin_part(skin, (20, 20, 28, 32), scale, (20, 36, 28, 48))
-    leg_right = render_skin_part(skin, (4, 20, 8, 32), scale, (4, 36, 8, 48))
-    arm_right = render_skin_part(skin, (44, 20, 48, 32), scale, (44, 36, 48, 48))
-
-    if h == 64:
-        leg_left = render_skin_part(skin, (20, 52, 24, 64), scale, (20, 52, 24, 64))
-        arm_left = render_skin_part(skin, (36, 52, 40, 64), scale, (36, 52, 40, 64))
-    else:
-        leg_left = Image.new("RGBA", (4*scale, 12*scale), (0,0,0,0))
-        arm_left = Image.new("RGBA", (4*scale, 12*scale), (0,0,0,0))
-
-    head_back = render_skin_part(skin, (24, 8, 32, 16), scale, (48, 8, 56, 16))
-    body_back = render_skin_part(skin, (32, 20, 40, 32), scale, (32, 36, 40, 48))
-    leg_right_back = render_skin_part(skin, (12, 20, 16, 32), scale, (12, 36, 16, 48))
-    arm_right_back = render_skin_part(skin, (52, 20, 56, 32), scale, (52, 36, 56, 48))
-    if h == 64:
-        leg_left_back = render_skin_part(skin, (28, 52, 32, 64), scale, (28, 52, 32, 64))
-        arm_left_back = render_skin_part(skin, (44, 52, 48, 64), scale, (44, 52, 48, 64))
-    else:
-        leg_left_back = Image.new("RGBA", (4*scale, 12*scale), (0,0,0,0))
-        arm_left_back = Image.new("RGBA", (4*scale, 12*scale), (0,0,0,0))
-
-    front = Image.new("RGBA", (16*scale, 32*scale), (0,0,0,0))
-    front.paste(head, (4*scale, 0), head)
-    front.paste(body, (4*scale, 8*scale), body)
-    front.paste(arm_right, (8*scale, 8*scale), arm_right)
-    front.paste(arm_left, (0, 8*scale), arm_left)
-    front.paste(leg_right, (8*scale, 20*scale), leg_right)
-    front.paste(leg_left, (4*scale, 20*scale), leg_left)
-
-    back = Image.new("RGBA", (16*scale, 32*scale), (0,0,0,0))
-    back.paste(head_back, (4*scale, 0), head_back)
-    back.paste(body_back, (4*scale, 8*scale), body_back)
-    back.paste(arm_right_back, (8*scale, 8*scale), arm_right_back)
-    back.paste(arm_left_back, (0, 8*scale), arm_left_back)
-    back.paste(leg_right_back, (8*scale, 20*scale), leg_right_back)
-    back.paste(leg_left_back, (4*scale, 20*scale), leg_left_back)
-
-    combined = Image.new("RGBA", (18*scale, 34*scale), (0,0,0,0))
-    back.putalpha(128)
-    combined.paste(back, (2*scale, 2*scale), back)
-    combined.paste(front, (0, 0), front)
-    return combined
-
-async def create_skin_card(skin_path: str, bg_path: str, user_id: int, nickname: str) -> str | None:
-    try:
-        avatar = render_skin_front(skin_path, scale=8)
-        bg = Image.open(bg_path).convert("RGBA")
-        target_size = (800, 600)
-        bg = bg.resize(target_size, Image.LANCZOS)
-        av_w, av_h = avatar.size
-        av_x = (target_size[0] - av_w) // 2
-        av_y = int(target_size[1] * 0.2)
-        bg.paste(avatar, (av_x, av_y), avatar)
-
-        draw = ImageDraw.Draw(bg)
-        font_size = 48
-        font = None
-        font_paths = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans.ttf",
-            "arial.ttf",
-            "Arial.ttf",
-        ]
-        for fp in font_paths:
-            try:
-                font = ImageFont.truetype(fp, font_size)
-                break
-            except:
-                continue
-        if font is None:
-            font = ImageFont.load_default()
-            font_size = 16
-
-        text = nickname.upper()
-        if font:
-            bbox = draw.textbbox((0, 0), text, font=font)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        else:
-            tw, th = draw.textsize(text)
-        tx = (target_size[0] - tw) // 2
-        ty = av_y + av_h + 30
-
-        for dx, dy in [(-2,-2), (2,-2), (-2,2), (2,2)]:
-            draw.text((tx+dx, ty+dy), text, font=font, fill="black")
-        draw.text((tx, ty), text, font=font, fill="white")
-
-        result_path = os.path.join(DOWNLOADS_DIR, f"{user_id}_card.png")
-        bg.save(result_path)
-        return result_path
-    except Exception as e:
-        raise ValueError(f"Ошибка при создании карточки: {str(e)}")
 
 # === СКАЧИВАНИЕ ВИДЕО ===
 @dp.message(Command("dl"))
@@ -1235,11 +1188,7 @@ async def handle_document(message: types.Message):
         history = await load_history(user_id)
         history.append({"role": "user", "content": prompt})
 
-        response = await groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=history
-        )
-        reply = response.choices[0].message.content
+        reply = await ai_request(history)
 
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY_LENGTH:
@@ -1364,11 +1313,7 @@ async def handle_text(message: types.Message):
     history.append({"role": "user", "content": user_text})
 
     try:
-        response = await groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=history
-        )
-        reply = response.choices[0].message.content
+        reply = await ai_request(history)
 
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY_LENGTH:
