@@ -1,5 +1,5 @@
 aiogram
-openai
+groq
 aiofiles
 PyPDF2
 python-docx
