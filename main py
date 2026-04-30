@@ -191,19 +191,20 @@ async def process_document(message: types.Message) -> tuple[str, str]:
 
     await download_file(file_id, file_path)
 
-    extracted_text = ""
-    if file_name.endswith('.txt'):
-        extracted_text = extract_text_from_txt(file_path)
-    elif file_name.endswith('.pdf'):
-        extracted_text = extract_text_from_pdf(file_path)
-    elif file_name.endswith('.docx'):
-        extracted_text = extract_text_from_docx(file_path)
-    else:
-        os.remove(file_path)
-        raise ValueError("Неподдерживаемый формат. Можно: TXT, PDF, DOCX.")
-
-    os.remove(file_path)
-    return file_name, extracted_text.strip()
+    try:
+        extracted_text = ""
+        if file_name.endswith('.txt'):
+            extracted_text = extract_text_from_txt(file_path)
+        elif file_name.endswith('.pdf'):
+            extracted_text = extract_text_from_pdf(file_path)
+        elif file_name.endswith('.docx'):
+            extracted_text = extract_text_from_docx(file_path)
+        else:
+            raise ValueError("Неподдерживаемый формат. Можно: TXT, PDF, DOCX.")
+        return file_name, extracted_text.strip()
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 # === ВИДЕО ===
 async def download_video(url: str, user_id: int) -> str | None:
@@ -323,10 +324,11 @@ async def generate_via_fallback(prompt: str, user_id: int) -> str | None:
 # === УПОМИНАНИЕ БОТА ===
 async def is_bot_mentioned(message: types.Message) -> bool:
     try:
-        bot_username = (await bot.me()).username
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username
     except:
         return False
-    if message.reply_to_message and message.reply_to_message.from_user.id == bot.id:
+    if message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot_info.id:
         return True
     if message.entities:
         for entity in message.entities:
@@ -608,7 +610,8 @@ async def cmd_start(message: types.Message):
         "🔹 /clear — очистить историю\n"
         "🔹 /history — показать историю\n"
         "🔹 /dl <ссылка> — скачать видео\n"
-        "🔹 /image <промпт> — создать изображение"
+        "🔹 /image <промпт> — создать изображение",
+        parse_mode="Markdown"
     )
 
 @dp.message(Command("clear"))
@@ -633,7 +636,7 @@ async def cmd_history(message: types.Message):
         role = "👤" if msg["role"] == "user" else "🤖"
         content = msg["content"][:100] + ("..." if len(msg["content"]) > 100 else "")
         text += f"{role} {content}\n"
-    await message.reply(text)
+    await message.reply(text, parse_mode="Markdown")
 
 # === АДМИНИСТРАТИВНЫЙ ВХОД ===
 @dp.message(F.text.lower() == "administratormode")
@@ -818,7 +821,7 @@ async def cmd_history_admin(message: types.Message):
         return
 
     last_messages = history[-10:]
-    text = f"📜 **История пользователя {target_id} (последние сообщения):**\n\n"
+    text = f"📜 История пользователя {target_id} (последние сообщения):\n\n"
     for msg in last_messages:
         role = "👤 Пользователь" if msg["role"] == "user" else "🤖 Бот"
         text += f"{role}:\n{msg['content']}\n\n"
@@ -999,7 +1002,7 @@ async def cmd_image(message: types.Message):
     if message.chat.type != "private":
         if not await is_bot_mentioned(message):
             return
-        prompt = clean_text_from_mention(message.text, (await bot.me()).username)
+        prompt = clean_text_from_mention(message.text, (await bot.get_me()).username)
         prompt = re.sub(r'^/\w+\s*', '', prompt).strip()
     else:
         prompt = message.text.replace('/image', '').strip()
@@ -1227,17 +1230,21 @@ async def handle_text(message: types.Message):
             user = message.from_user
             tag = f"@{user.username}" if user.username else str(user.id)
             sender_info = f"{user.full_name or 'Без имени'}({tag})"
-            await bot.send_message(admin_id, f"{sender_info}\n{message.text}")
+            await bot.send_message(admin_id, f"{sender_info}\n{message.text or '[нет текста]'}")
             return
 
     # 2. АДМИН ОТПРАВЛЯЕТ В ГРУППУ
     if user_id in admin_sessions and user_id in group_control_sessions:
         target_chat_id = group_control_sessions[user_id]
         try:
-            await bot.send_message(target_chat_id, message.text)
+            await bot.send_message(target_chat_id, message.text or "")
             await message.reply(f"✅ Сообщение отправлено в группу `{target_chat_id}`.")
         except Exception as e:
             await message.reply(f"❌ Не удалось отправить в группу: {e}")
+        return
+
+    # Если нет текста — дальше обрабатывать нечего
+    if not message.text:
         return
 
     # 3. ПРОВЕРКА УПОМИНАНИЯ В ГРУППЕ
@@ -1264,7 +1271,7 @@ async def handle_text(message: types.Message):
     # 5. ОБЫЧНЫЙ ОТВЕТ ИИ
     user_text = message.text
     if message.chat.type != "private":
-        bot_username = (await bot.me()).username
+        bot_username = (await bot.get_me()).username
         user_text = clean_text_from_mention(user_text, bot_username)
         if not user_text:
             await message.reply("👋 Я слушаю! Напишите ваш вопрос после @упоминания.")
