@@ -14,7 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import FSInputFile
-from openai import AsyncOpenAI
+from groq import AsyncGroq
 import PyPDF2
 from docx import Document
 import yt_dlp
@@ -22,12 +22,12 @@ import yt_dlp
 # === НАСТРОЙКИ (ИМПОРТ ИЗ config.py) ===
 try:
     from config import (
-        TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY
+        TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY
     )
 except ImportError:
     raise ImportError(
         "Не найден файл config.py. Создайте его с переменными:\n"
-        "TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY"
+        "TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY"
     )
 
 # CLOUD_CHANNEL_ID – опциональный параметр
@@ -39,32 +39,14 @@ try:
 except (ImportError, ValueError):
     pass
 
-if not all([TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY]):
-    raise ValueError("TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY должны быть заполнены")
+if not all([TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY]):
+    raise ValueError("TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_KEY должны быть заполнены")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# OpenRouter — OpenAI-совместимый API
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-# Цепочка бесплатных моделей (по убыванию приоритета).
-# Источник: openrouter.ai/collections/free-models, апрель 2026.
-# При недоступности одной бот автоматически переходит к следующей.
-#
-# 1. Llama 3.3 70B  — самая популярная бесплатная модель для общего чата на OpenRouter
-# 2. Gemma 4 31B    — от Google, 256K контекст, сильное рассуждение
-# 3. GPT-OSS 20B    — от OpenAI, первая open-weight модель под Apache 2.0
-AI_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemma-4-31b-it:free",
-    "openai/gpt-oss-20b:free",
-]
-
-ai_client = AsyncOpenAI(
-    api_key=OPENROUTER_API_KEY,
-    base_url=OPENROUTER_BASE_URL,
-)
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # Папки
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -78,31 +60,6 @@ os.makedirs(ACTIVITY_DIR, exist_ok=True)
 
 MAX_HISTORY_LENGTH = 10
 ONLINE_THRESHOLD = 300  # 5 минут
-
-# === AI ЗАПРОС С АВТОМАТИЧЕСКИМ FALLBACK ===
-async def ai_request(messages: list) -> str:
-    """
-    Отправляет запрос к OpenRouter.
-    Перебирает модели по списку AI_MODELS: если одна недоступна — переходит к следующей.
-    """
-    for model in AI_MODELS:
-        try:
-            response = await ai_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=1024,
-                extra_headers={
-                    "HTTP-Referer": "https://t.me",
-                    "X-Title": "TelegramBot",
-                }
-            )
-            text = response.choices[0].message.content
-            if text:
-                return text
-        except Exception as e:
-            print(f"[ai] Модель {model} недоступна: {e}")
-            continue
-    raise RuntimeError("Все AI-модели недоступны. Попробуйте позже.")
 
 # === ХРАНЕНИЕ СЕССИЙ ===
 admin_sessions = set()
@@ -719,7 +676,7 @@ async def process_password(message: types.Message, state: FSMContext):
             "/groups — список групп\n"
             "/group_connect <айди> — управлять группой\n"
             "/group_connect stop — завершить управление группой\n"
-            "/setaikey <ключ> — временно сменить ключ OpenRouter (на одну сессию)\n"
+            "/setgroqkey <ключ> — временно сменить ключ Groq (на одну сессию)\n"
             "/backup — создать бэкап и сохранить в облако\n"
             "/restore — восстановить данные из облака"
         )
@@ -1006,9 +963,9 @@ async def cmd_restore(message: types.Message):
             "• В канале нет сообщений с файлом `bot_data_backup.zip`"
         )
 
-# === СМЕНА КЛЮЧА OPENROUTER (НЕ ТРОГАЕТ config.py) ===
-@dp.message(Command("setaikey"))
-async def cmd_set_ai_key(message: types.Message):
+# === БЕЗОПАСНАЯ СМЕНА КЛЮЧА GROQ (НЕ ТРОГАЕТ config.py) ===
+@dp.message(Command("setgroqkey"))
+async def cmd_set_groq_key(message: types.Message):
     await update_user_activity(message.from_user.id, message.from_user)
     if message.chat.type != "private":
         await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
@@ -1019,18 +976,18 @@ async def cmd_set_ai_key(message: types.Message):
 
     args = message.text.split()
     if len(args) != 2:
-        await message.reply("Используйте: /setaikey <новый_ключ>")
+        await message.reply("Используйте: /setgroqkey <новый_ключ>")
         return
     new_key = args[1]
-    if not new_key.startswith("sk-or-"):
-        await message.reply("❌ Ключ OpenRouter должен начинаться с 'sk-or-'")
+    if not new_key.startswith("gsk_"):
+        await message.reply("❌ Ключ Groq должен начинаться с 'gsk_'")
         return
 
-    global ai_client, OPENROUTER_API_KEY
+    global groq_client, GROQ_API_KEY
     try:
-        ai_client = AsyncOpenAI(api_key=new_key, base_url=OPENROUTER_BASE_URL)
-        OPENROUTER_API_KEY = new_key
-        await message.reply("✅ Ключ OpenRouter временно изменён (до перезапуска бота).")
+        groq_client = AsyncGroq(api_key=new_key)
+        GROQ_API_KEY = new_key
+        await message.reply("✅ Ключ Groq временно изменён (до перезапуска бота).")
     except Exception as e:
         await message.reply(f"❌ Ошибка смены ключа: {e}")
 
@@ -1188,7 +1145,11 @@ async def handle_document(message: types.Message):
         history = await load_history(user_id)
         history.append({"role": "user", "content": prompt})
 
-        reply = await ai_request(history)
+        response = await groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=history
+        )
+        reply = response.choices[0].message.content
 
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY_LENGTH:
@@ -1313,7 +1274,11 @@ async def handle_text(message: types.Message):
     history.append({"role": "user", "content": user_text})
 
     try:
-        reply = await ai_request(history)
+        response = await groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=history
+        )
+        reply = response.choices[0].message.content
 
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY_LENGTH:
