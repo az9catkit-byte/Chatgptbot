@@ -45,7 +45,6 @@ if not all([TELEGRAM_BOT_TOKEN, GROQ_API_KEY, ADMIN_PASSWORD, POLLINATIONS_API_K
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # Папки
@@ -191,20 +190,19 @@ async def process_document(message: types.Message) -> tuple[str, str]:
 
     await download_file(file_id, file_path)
 
-    try:
-        extracted_text = ""
-        if file_name.endswith('.txt'):
-            extracted_text = extract_text_from_txt(file_path)
-        elif file_name.endswith('.pdf'):
-            extracted_text = extract_text_from_pdf(file_path)
-        elif file_name.endswith('.docx'):
-            extracted_text = extract_text_from_docx(file_path)
-        else:
-            raise ValueError("Неподдерживаемый формат. Можно: TXT, PDF, DOCX.")
-        return file_name, extracted_text.strip()
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+    extracted_text = ""
+    if file_name.endswith('.txt'):
+        extracted_text = extract_text_from_txt(file_path)
+    elif file_name.endswith('.pdf'):
+        extracted_text = extract_text_from_pdf(file_path)
+    elif file_name.endswith('.docx'):
+        extracted_text = extract_text_from_docx(file_path)
+    else:
+        os.remove(file_path)
+        raise ValueError("Неподдерживаемый формат. Можно: TXT, PDF, DOCX.")
+
+    os.remove(file_path)
+    return file_name, extracted_text.strip()
 
 # === ВИДЕО ===
 async def download_video(url: str, user_id: int) -> str | None:
@@ -324,11 +322,10 @@ async def generate_via_fallback(prompt: str, user_id: int) -> str | None:
 # === УПОМИНАНИЕ БОТА ===
 async def is_bot_mentioned(message: types.Message) -> bool:
     try:
-        bot_info = await bot.get_me()
-        bot_username = bot_info.username
+        bot_username = (await bot.me()).username
     except:
         return False
-    if message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot_info.id:
+    if message.reply_to_message and message.reply_to_message.from_user.id == bot.id:
         return True
     if message.entities:
         for entity in message.entities:
@@ -347,253 +344,81 @@ def clean_text_from_mention(text: str, bot_username: str) -> str:
 # === ОБЛАЧНОЕ СОХРАНЕНИЕ ===
 BACKUP_FILENAME = "bot_data_backup.zip"
 
-# Файл для хранения message_id последнего бэкапа в канале
-BACKUP_INDEX_FILE = os.path.join(BASE_DIR, "last_backup_msg_id.txt")
-
-
-def _save_backup_msg_id(msg_id: int):
-    """Сохраняет message_id последнего бэкапа локально."""
-    try:
-        with open(BACKUP_INDEX_FILE, 'w') as f:
-            f.write(str(msg_id))
-    except Exception as e:
-        print(f"[backup] Не удалось сохранить msg_id: {e}")
-
-
-def _load_backup_msg_id() -> int | None:
-    """Читает message_id последнего бэкапа из локального файла."""
-    try:
-        if os.path.exists(BACKUP_INDEX_FILE):
-            with open(BACKUP_INDEX_FILE, 'r') as f:
-                val = f.read().strip()
-                return int(val) if val else None
-    except Exception as e:
-        print(f"[backup] Не удалось прочитать msg_id: {e}")
-    return None
-
-
 async def create_backup_zip() -> str | None:
-    """Создаёт ZIP-архив со всеми данными бота."""
     try:
         backup_path = os.path.join(DOWNLOADS_DIR, BACKUP_FILENAME)
         with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # История диалогов
             for root, _, files in os.walk(DATA_DIR):
                 for file in files:
                     if file.endswith('.json'):
                         full_path = os.path.join(root, file)
                         arcname = os.path.relpath(full_path, BASE_DIR)
                         zipf.write(full_path, arcname)
-            # Активность пользователей
             for root, _, files in os.walk(ACTIVITY_DIR):
                 for file in files:
                     if file.endswith('.json'):
                         full_path = os.path.join(root, file)
                         arcname = os.path.relpath(full_path, BASE_DIR)
                         zipf.write(full_path, arcname)
-            # Список групп
             if os.path.exists(GROUPS_FILE):
                 zipf.write(GROUPS_FILE, os.path.basename(GROUPS_FILE))
-        print(f"[backup] Архив создан: {backup_path}")
+            config_path = os.path.join(BASE_DIR, "config.py")
+            if os.path.exists(config_path):
+                zipf.write(config_path, "config.py")
         return backup_path
     except Exception as e:
-        print(f"[backup] Ошибка создания архива: {e}")
+        print(f"Ошибка создания бэкапа: {e}")
         return None
-
 
 async def upload_to_telegram_cloud(file_path: str) -> bool:
-    """
-    Отправляет ZIP в приватный канал и сохраняет message_id отправленного сообщения.
-    message_id нужен для надёжного скачивания при восстановлении.
-    """
     if not CLOUD_CHANNEL_ID:
-        print("[backup] CLOUD_CHANNEL_ID не задан, пропускаем.")
         return False
     try:
-        sent = await bot.send_document(
+        await bot.send_document(
             CLOUD_CHANNEL_ID,
-            FSInputFile(file_path, filename=BACKUP_FILENAME),
-            caption=f"🗂 Бэкап | {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            FSInputFile(file_path, filename=BACKUP_FILENAME)
         )
-        _save_backup_msg_id(sent.message_id)
-        print(f"[backup] Бэкап отправлен в канал, msg_id={sent.message_id}")
         return True
     except Exception as e:
-        print(f"[backup] Ошибка отправки в канал: {e}")
+        print(f"Ошибка отправки в облако: {e}")
         return False
-
-
-async def _find_latest_backup_msg_id() -> int | None:
-    """
-    Ищет message_id последнего бэкапа.
-    Сначала проверяет локальный файл-индекс, потом перебирает
-    последние сообщения канала через forward_messages-трюк.
-    """
-    # 1. Быстрый путь — локальный индекс
-    local_id = _load_backup_msg_id()
-    if local_id:
-        print(f"[backup] Найден локальный msg_id={local_id}")
-        return local_id
-
-    # 2. Медленный путь — перебираем последние ~50 сообщений канала назад
-    # Telegram Bot API не имеет getChatHistory, но позволяет forwardMessage:
-    # если msg_id существует и содержит документ — это наш бэкап.
-    # Стартуем с большого числа и идём вниз пока не найдём документ.
-    print("[backup] Локальный индекс отсутствует, ищем бэкап в канале...")
-    if not CLOUD_CHANNEL_ID:
-        return None
-
-    # Пробуем получить последнее сообщение канала через copyMessage (оно всегда последнее)
-    # Будем искать в диапазоне последних 200 message_id
-    # Для этого используем трюк: отправляем заглушку и смотрим её message_id
-    probe_msg = None
-    try:
-        probe_msg = await bot.send_message(CLOUD_CHANNEL_ID, "🔍 Поиск бэкапа...")
-        max_id = probe_msg.message_id
-        await bot.delete_message(CLOUD_CHANNEL_ID, probe_msg.message_id)
-        probe_msg = None
-    except Exception as e:
-        print(f"[backup] Не удалось определить последний msg_id канала: {e}")
-        if probe_msg:
-            try:
-                await bot.delete_message(CLOUD_CHANNEL_ID, probe_msg.message_id)
-            except:
-                pass
-        return None
-
-    # Перебираем последние 200 сообщений в поисках документа с нужным именем
-    search_limit = min(max_id, 200)
-    for msg_id in range(max_id - 1, max_id - search_limit - 1, -1):
-        if msg_id <= 0:
-            break
-        try:
-            # forward в скрытый чат не работает через Bot API без прав.
-            # Единственный способ — копировать сообщение в служебный чат.
-            # Но у нас нет такого чата. Используем getFile через file_id,
-            # который получаем через forwardMessage к самому боту.
-            # Однако проще: просто пробуем скопировать сообщение во временный
-            # буфер — сам канал — и сразу удалить.
-            # Самый надёжный вариант без side-effects: используем
-            # bot.copy_message, ловим исключение если сообщения нет.
-            copied = await bot.copy_message(
-                chat_id=CLOUD_CHANNEL_ID,
-                from_chat_id=CLOUD_CHANNEL_ID,
-                message_id=msg_id
-            )
-            # Если дошли сюда — сообщение существует. Проверяем это через forward.
-            # Удаляем копию и пробуем скачать оригинал.
-            await bot.delete_message(CLOUD_CHANNEL_ID, copied.message_id)
-
-            # Теперь нужно узнать, документ ли это. Форвардим в личку боту — нельзя.
-            # Но мы можем попробовать скачать через file_id, которого у нас нет.
-            # Проблема: Bot API не возвращает содержимое сообщений канала напрямую.
-            # Решение: сохраняем msg_id и пробуем скачать в restore-функции,
-            # она сама проверит документ.
-            _save_backup_msg_id(msg_id)
-            print(f"[backup] Найдено сообщение msg_id={msg_id} в канале")
-            return msg_id
-        except Exception:
-            continue
-
-    print("[backup] Бэкапы в канале не найдены.")
-    return None
-
 
 async def restore_from_telegram_cloud() -> bool:
-    """
-    Скачивает последний бэкап из приватного канала и распаковывает данные.
-
-    Алгоритм:
-    1. Берём msg_id из локального индекса (быстро) или ищем в канале (медленно).
-    2. Форвардим сообщение с документом в Saved Messages бота, чтобы получить file_id.
-    3. Скачиваем файл, распаковываем, удаляем временную копию.
-    """
     if not CLOUD_CHANNEL_ID:
-        print("[backup] CLOUD_CHANNEL_ID не задан.")
         return False
-
-    msg_id = await _find_latest_backup_msg_id()
-    if not msg_id:
-        print("[backup] Не удалось найти msg_id бэкапа.")
-        return False
-
-    forwarded = None
-    downloaded_path = os.path.join(DOWNLOADS_DIR, "restored_backup.zip")
-
     try:
-        # Форвардим сообщение из канала себе (в чат бота с самим собой = bot.id)
-        # чтобы получить объект Message с document.file_id
-        bot_info = await bot.get_me()
-        forwarded = await bot.forward_message(
-            chat_id=bot_info.id,
-            from_chat_id=CLOUD_CHANNEL_ID,
-            message_id=msg_id
-        )
-
-        if not forwarded.document:
-            print(f"[backup] Сообщение msg_id={msg_id} не содержит документа.")
-            # Сбрасываем индекс — он был неверным
-            if os.path.exists(BACKUP_INDEX_FILE):
-                os.remove(BACKUP_INDEX_FILE)
+        updates = await bot.get_updates(offset=-10, limit=10, timeout=5)
+        target_message = None
+        for update in reversed(updates):
+            msg = update.message
+            if msg and msg.document and msg.chat.id == CLOUD_CHANNEL_ID:
+                target_message = msg
+                break
+        if not target_message:
             return False
+        file_id = target_message.document.file_id
+        file = await bot.get_file(file_id)
+        downloaded_path = os.path.join(DOWNLOADS_DIR, "restored_backup.zip")
+        await bot.download_file(file.file_path, downloaded_path)
 
-        if forwarded.document.file_name != BACKUP_FILENAME:
-            print(f"[backup] Документ называется '{forwarded.document.file_name}', ожидалось '{BACKUP_FILENAME}'.")
-            return False
-
-        # Скачиваем
-        file_info = await bot.get_file(forwarded.document.file_id)
-        await bot.download_file(file_info.file_path, downloaded_path)
-        print(f"[backup] Архив скачан: {downloaded_path}")
-
-        # Распаковываем
         with zipfile.ZipFile(downloaded_path, 'r') as zipf:
             zipf.extractall(BASE_DIR)
-        print("[backup] Данные успешно восстановлены.")
+        os.remove(downloaded_path)
         return True
-
     except Exception as e:
-        print(f"[backup] Ошибка восстановления: {e}")
+        print(f"Ошибка восстановления: {e}")
         return False
-    finally:
-        # Удаляем форвард из Saved Messages чтобы не засорять
-        if forwarded:
-            try:
-                await bot.delete_message(chat_id=forwarded.chat.id, message_id=forwarded.message_id)
-            except:
-                pass
-        # Удаляем временный файл
-        if os.path.exists(downloaded_path):
-            try:
-                os.remove(downloaded_path)
-            except:
-                pass
-
 
 async def restore_on_startup():
-    """
-    Проверка при старте: если локальных данных нет — тянем бэкап из канала.
-    Запускается до начала поллинга.
-    """
-    has_local_data = (
-        any(f.endswith('.json') for f in os.listdir(DATA_DIR))
-        or os.path.exists(GROUPS_FILE)
-    )
-
-    if has_local_data:
-        print("[backup] Локальные данные найдены, восстановление не нужно.")
-        return
-
-    if not CLOUD_CHANNEL_ID:
-        print("[backup] Облачное хранилище не настроено, пропускаем восстановление.")
-        return
-
-    print("[backup] Локальные данные отсутствуют — пробуем восстановить из облака...")
-    success = await restore_from_telegram_cloud()
-    if success:
-        print("[backup] ✅ Данные восстановлены из облака.")
-    else:
-        print("[backup] ⚠️ Не удалось восстановить данные. Бот запустится с чистого листа.")
+    if not any(os.listdir(DATA_DIR)) and not os.path.exists(GROUPS_FILE):
+        if CLOUD_CHANNEL_ID:
+            print("Локальные данные отсутствуют. Пробуем восстановить из облака...")
+            if await restore_from_telegram_cloud():
+                print("Восстановление прошло успешно.")
+            else:
+                print("Не удалось восстановить.")
+        else:
+            print("Облачное хранилище не настроено. Пропускаем восстановление.")
 
 # === ХЕНДЛЕРЫ КОМАНД ===
 @dp.message(Command("start"))
@@ -610,8 +435,7 @@ async def cmd_start(message: types.Message):
         "🔹 /clear — очистить историю\n"
         "🔹 /history — показать историю\n"
         "🔹 /dl <ссылка> — скачать видео\n"
-        "🔹 /image <промпт> — создать изображение",
-        parse_mode="Markdown"
+        "🔹 /image <промпт> — создать изображение"
     )
 
 @dp.message(Command("clear"))
@@ -636,7 +460,7 @@ async def cmd_history(message: types.Message):
         role = "👤" if msg["role"] == "user" else "🤖"
         content = msg["content"][:100] + ("..." if len(msg["content"]) > 100 else "")
         text += f"{role} {content}\n"
-    await message.reply(text, parse_mode="Markdown")
+    await message.reply(text)
 
 # === АДМИНИСТРАТИВНЫЙ ВХОД ===
 @dp.message(F.text.lower() == "administratormode")
@@ -680,8 +504,9 @@ async def process_password(message: types.Message, state: FSMContext):
             "/group_connect <айди> — управлять группой\n"
             "/group_connect stop — завершить управление группой\n"
             "/setgroqkey <ключ> — временно сменить ключ Groq (на одну сессию)\n"
-            "/backup — создать бэкап и сохранить в облако\n"
-            "/restore — восстановить данные из облака"
+            "/backup — создать и отправить бекап в облако\n"
+            "/restore — восстановить данные из облака\n"
+            "/sync_data — полная синхронизация с облаком"
         )
     else:
         await message.reply("❌ Неверный пароль.")
@@ -821,7 +646,7 @@ async def cmd_history_admin(message: types.Message):
         return
 
     last_messages = history[-10:]
-    text = f"📜 История пользователя {target_id} (последние сообщения):\n\n"
+    text = f"📜 **История пользователя {target_id} (последние сообщения):**\n\n"
     for msg in last_messages:
         role = "👤 Пользователь" if msg["role"] == "user" else "🤖 Бот"
         text += f"{role}:\n{msg['content']}\n\n"
@@ -915,29 +740,17 @@ async def cmd_backup(message: types.Message):
         await message.reply("❌ ID облачного канала не настроен. Добавьте CLOUD_CHANNEL_ID в config.py.")
         return
 
-    status_msg = await message.reply("📦 Создаю архив данных...")
+    await message.reply("📦 Создаю резервную копию данных...")
     backup_path = await create_backup_zip()
     if not backup_path:
-        await status_msg.edit_text("❌ Не удалось создать архив. Проверьте логи.")
+        await message.reply("❌ Не удалось создать архив с данными.")
         return
-
-    await status_msg.edit_text("☁️ Отправляю архив в канал...")
-    success = await upload_to_telegram_cloud(backup_path)
-
+    if await upload_to_telegram_cloud(backup_path):
+        await message.reply("✅ Данные успешно отправлены в облачное хранилище.")
+    else:
+        await message.reply("❌ Не удалось отправить данные в облако.")
     if os.path.exists(backup_path):
         os.remove(backup_path)
-
-    if success:
-        msg_id = _load_backup_msg_id()
-        await status_msg.edit_text(
-            f"✅ Бэкап успешно сохранён в облако.\n"
-            f"📌 msg_id: `{msg_id}`\n"
-            f"🕐 {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            parse_mode="Markdown"
-        )
-    else:
-        await status_msg.edit_text("❌ Не удалось отправить архив в канал. Проверьте права бота в канале.")
-
 
 @dp.message(Command("restore"))
 async def cmd_restore(message: types.Message):
@@ -952,19 +765,42 @@ async def cmd_restore(message: types.Message):
         await message.reply("❌ ID облачного канала не настроен.")
         return
 
-    status_msg = await message.reply("🔍 Ищу последний бэкап в канале...")
-    success = await restore_from_telegram_cloud()
-
-    if success:
-        await status_msg.edit_text("✅ Данные успешно восстановлены из облака.")
+    await message.reply("🔄 Восстанавливаю данные из облака...")
+    if await restore_from_telegram_cloud():
+        await message.reply("✅ Данные успешно восстановлены из облака.")
     else:
-        await status_msg.edit_text(
-            "❌ Не удалось восстановить данные.\n\n"
-            "Возможные причины:\n"
-            "• Бэкап ещё не создавался (/backup)\n"
-            "• Бот не является администратором канала\n"
-            "• В канале нет сообщений с файлом `bot_data_backup.zip`"
-        )
+        await message.reply("❌ Не удалось восстановить данные из облака.")
+
+@dp.message(Command("sync_data"))
+async def cmd_sync_data(message: types.Message):
+    await update_user_activity(message.from_user.id, message.from_user)
+    if message.chat.type != "private":
+        await message.reply("⛔ Эта команда доступна только в личных сообщениях.")
+        return
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет прав для этой команды.")
+        return
+    if not CLOUD_CHANNEL_ID:
+        await message.reply("❌ ID облачного канала не настроен.")
+        return
+
+    await message.reply("🔁 Синхронизирую данные с облаком...")
+    backup_path = await create_backup_zip()
+    if not backup_path:
+        await message.reply("❌ Не удалось создать архив.")
+        return
+    if not await upload_to_telegram_cloud(backup_path):
+        await message.reply("❌ Не удалось отправить данные.")
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        return
+    if os.path.exists(backup_path):
+        os.remove(backup_path)
+
+    if await restore_from_telegram_cloud():
+        await message.reply("✅ Данные синхронизированы с облаком.")
+    else:
+        await message.reply("❌ Не удалось восстановить данные из облака.")
 
 # === БЕЗОПАСНАЯ СМЕНА КЛЮЧА GROQ (НЕ ТРОГАЕТ config.py) ===
 @dp.message(Command("setgroqkey"))
@@ -1002,7 +838,7 @@ async def cmd_image(message: types.Message):
     if message.chat.type != "private":
         if not await is_bot_mentioned(message):
             return
-        prompt = clean_text_from_mention(message.text, (await bot.get_me()).username)
+        prompt = clean_text_from_mention(message.text, (await bot.me()).username)
         prompt = re.sub(r'^/\w+\s*', '', prompt).strip()
     else:
         prompt = message.text.replace('/image', '').strip()
@@ -1230,21 +1066,17 @@ async def handle_text(message: types.Message):
             user = message.from_user
             tag = f"@{user.username}" if user.username else str(user.id)
             sender_info = f"{user.full_name or 'Без имени'}({tag})"
-            await bot.send_message(admin_id, f"{sender_info}\n{message.text or '[нет текста]'}")
+            await bot.send_message(admin_id, f"{sender_info}\n{message.text}")
             return
 
     # 2. АДМИН ОТПРАВЛЯЕТ В ГРУППУ
     if user_id in admin_sessions and user_id in group_control_sessions:
         target_chat_id = group_control_sessions[user_id]
         try:
-            await bot.send_message(target_chat_id, message.text or "")
+            await bot.send_message(target_chat_id, message.text)
             await message.reply(f"✅ Сообщение отправлено в группу `{target_chat_id}`.")
         except Exception as e:
             await message.reply(f"❌ Не удалось отправить в группу: {e}")
-        return
-
-    # Если нет текста — дальше обрабатывать нечего
-    if not message.text:
         return
 
     # 3. ПРОВЕРКА УПОМИНАНИЯ В ГРУППЕ
@@ -1271,7 +1103,7 @@ async def handle_text(message: types.Message):
     # 5. ОБЫЧНЫЙ ОТВЕТ ИИ
     user_text = message.text
     if message.chat.type != "private":
-        bot_username = (await bot.get_me()).username
+        bot_username = (await bot.me()).username
         user_text = clean_text_from_mention(user_text, bot_username)
         if not user_text:
             await message.reply("👋 Я слушаю! Напишите ваш вопрос после @упоминания.")
