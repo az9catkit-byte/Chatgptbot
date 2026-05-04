@@ -1,7 +1,14 @@
-# .gitignore
+# Секретные данные — никогда не загружать в GitHub
 config.py
+
+# Данные бота (генерируются во время работы)
 user_data/
+user_activity/
 downloads/
+last_backup_msg_id.txt
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
 .env
